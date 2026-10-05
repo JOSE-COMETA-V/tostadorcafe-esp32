@@ -1,0 +1,1480 @@
+/**
+ * @file main.c
+ * @brief Sistema de Control y Monitoreo de Tostado de Café con ESP32 (ESP-IDF).
+ * @details Este sistema gestiona un proceso de tostado de café (diseñado para muestras de 100g de Café Arábigo),
+ *          controlando la temperatura mediante histéresis, el movimiento del tambor mediante pulsos de motor,
+ *          la recolección de humedad ambiental (DHT11), lectura de termocupla (MAX6675), reloj en tiempo
+ *          real I2C (DS3231), registro de datos en tarjeta SD (FAT/SPI) e interfaz Web (HTTP/Wi-Fi STA).
+ *
+ * Arquitectura de Tareas FreeRTOS y Sincronización:
+ * - `vTaskRTC`: Actualiza periódicamente la cadena de fecha/hora global protegida por `xTimeMutex`.
+ * - `vTaskMotorPulse`: Genera modulación por ancho de pulso por software para el relé del motor.
+ * - `vTaskSensorAndControl`: Bucle maestro (1 Hz) para lectura de sensores, control térmico y temporizador.
+ * - `vTaskIndicators`: Controla el estado visual y sonoro (LEDs y Buzzer).
+ * - `vTaskSDWriter`: Recibe datos de sesiones y lecturas por `xQueueSD` y escribe en memoria Flash SD.
+ * - `vTaskSerial`: Transmite las lecturas periódicas en formato CSV a la consola serie.
+ *
+ * @author Sistema de Control de Tostado
+ * @date 2026-10-04
+ * @version 1.0.0
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <sys/stat.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/queue.h"
+
+#include "driver/spi_master.h"
+#include "driver/gpio.h"
+#include "driver/i2c.h"
+#include "driver/sdspi_host.h"
+
+#include "esp_log.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "esp_http_server.h"
+#include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
+#include "esp_timer.h"
+#include "rom/ets_sys.h"
+
+/** @brief Etiqueta principal para registros del sistema (ESP_LOG). */
+static const char *TAG = "THERMO_RTC_SD_WEB";
+
+/* =======================================================================
+ * CONFIGURACIÓN DE RED Y COMUNICACIONES
+ * ======================================================================= */
+
+/** @brief SSID de la red Wi-Fi a la que se conectará el ESP32 en modo Station. */
+#define WIFI_SSID      "RANGER"
+/** @brief Contraseña de la red Wi-Fi. */
+#define WIFI_PASS      "Colombia1989@"
+
+/* =======================================================================
+ * CONFIGURACIÓN DE PINES GPIO
+ * ======================================================================= */
+
+/** @brief Pin GPIO conectado al relé del motor del barril/tambor. */
+#define MOTOR_RELAY_PIN   GPIO_NUM_26
+/** @brief Pin GPIO conectado al relé de la fuente de calor (calefactor). */
+#define HEATER_RELAY_PIN  GPIO_NUM_25
+/** @brief Máscara de bits para la configuración de GPIOs de los relés de potencia. */
+#define RELAY_PIN_SEL     ((1ULL << MOTOR_RELAY_PIN) | (1ULL << HEATER_RELAY_PIN))
+
+/** @brief Pin GPIO asignado a la línea de datos del sensor DHT11. */
+#define DHT11_PIN         GPIO_NUM_32
+
+/** @brief Pin MISO del bus SPI para la tarjeta SD (SPI2_HOST). */
+#define PIN_SD_MISO       19
+/** @brief Pin MOSI del bus SPI para la tarjeta SD (SPI2_HOST). */
+#define PIN_SD_MOSI       23
+/** @brief Pin Clock (CLK) del bus SPI para la tarjeta SD (SPI2_HOST). */
+#define PIN_SD_CLK        18
+/** @brief Pin Chip Select (CS) para la tarjeta SD. */
+#define PIN_CS_SD         5
+
+/** @brief Pin MISO del bus SPI para el amplificador de termocupla MAX6675 (SPI3_HOST). */
+#define PIN_MAX_MISO      27
+/** @brief Pin Clock (CLK) del bus SPI para el MAX6675 (SPI3_HOST). */
+#define PIN_MAX_CLK       14
+/** @brief Pin Chip Select (CS) para el amplificador MAX6675. */
+#define PIN_CS_MAX6675    4
+
+/** @brief Pin SDA del bus I2C (DS3231 RTC). */
+#define I2C_SDA_PIN       21
+/** @brief Pin SCL del bus I2C (DS3231 RTC). */
+#define I2C_SCL_PIN       22
+/** @brief Dirección I2C de 7 bits del reloj de tiempo real DS3231. */
+#define DS3231_I2C_ADDR   0x68
+
+/* =======================================================================
+ * INDICADORES DE ESTADO
+ * ======================================================================= */
+
+/** @brief Pin GPIO conectado al Buzzer pasivo/activo. */
+#define BUZZER_PIN        GPIO_NUM_33
+/** @brief Pin GPIO conectado al LED indicador de proceso de tostado activo (Rojo). */
+#define LED_ACTIVE_PIN    GPIO_NUM_17
+/** @brief Pin GPIO conectado al LED indicador de sistema en reposo/detenido. */
+#define LED_STOPPED_PIN   GPIO_NUM_16
+/** @brief Máscara de bits para los GPIOs de indicadores visuales y sonoros. */
+#define INDICATOR_PIN_SEL ((1ULL << BUZZER_PIN) | (1ULL << LED_ACTIVE_PIN) | (1ULL << LED_STOPPED_PIN))
+
+/** @brief Semiperíodo de oscilación del buzzer en milisegundos (1s encendido, 1s apagado). */
+#define BUZZER_HALF_PERIOD_MS     1000
+/** @brief Período de refresco de la tarea de control de indicadores en ms. */
+#define INDICATOR_TASK_PERIOD_MS  100
+
+/* =======================================================================
+ * PARÁMETROS DEL PULSADO DEL MOTOR (CONTROL DE VELOCIDAD)
+ * ======================================================================= */
+
+/** @brief Habilita (1) o deshabilita (0) la modulación por pulso del relé del motor. */
+#define MOTOR_PULSE_ENABLE        1
+/** @brief Período total del ciclo de pulso del motor en ms. */
+#define MOTOR_PULSE_PERIOD_MS     1000
+/** @brief Tiempo activo (ON) dentro de cada período en ms (a mayor tiempo, mayor velocidad). */
+#define MOTOR_PULSE_ON_MS         200
+/** @brief Paso de evaluación de la tarea de pulsado del motor en ms. */
+#define MOTOR_PULSE_STEP_MS       10
+
+/* =======================================================================
+ * PARÁMETROS DE CONTROL DEL PROCESO DE TOSTADO
+ * ======================================================================= */
+
+/** @brief Ancho de la banda de histéresis en °C para el control del calefactor. */
+#define ROAST_HYSTERESIS_C        5.0f
+
+/**
+ * @brief Modo de conteo del temporizador de tostado.
+ * 0 = Conteo inmediato desde que se presiona Iniciar.
+ * 1 = Conteo únicamente al alcanzar la temperatura objetivo por primera vez.
+ */
+#define ROAST_TIMER_FROM_SETPOINT 0
+
+/** @brief Límite inferior de temperatura permitida en modo manual (°C). */
+#define ROAST_TEMP_MIN_C          30.0f
+/** @brief Límite superior de temperatura permitida en modo manual (°C). */
+#define ROAST_TEMP_MAX_C          250.0f
+/** @brief Límite inferior de tiempo de tostado (segundos). */
+#define ROAST_TIME_MIN_S          10
+/** @brief Límite superior de tiempo de tostado (7200 s = 2 horas). */
+#define ROAST_TIME_MAX_S          7200
+
+/** @brief Umbral inferior de humedad relativa (%) para clasificación "MUY SECO". */
+#define HUM_LIMIT_DRY             50.0f
+/** @brief Umbral superior de humedad relativa (%) para clasificación "MUY HUMEDO". */
+#define HUM_LIMIT_WET             65.0f
+
+/** @brief Temperatura objetivo en modo automático para café con alta humedad (°C). */
+#define AUTO_WET_TEMP_C           60.0f
+/** @brief Tiempo de tostado en modo automático para café con alta humedad (s). */
+#define AUTO_WET_TIME_S           (5 * 60)
+/** @brief Temperatura objetivo en modo automático para café con humedad ideal (°C). */
+#define AUTO_IDEAL_TEMP_C         65.0f
+/** @brief Tiempo de tostado en modo automático para café con humedad ideal (s). */
+#define AUTO_IDEAL_TIME_S         (6 * 60)
+/** @brief Temperatura objetivo en modo automático para café muy seco (°C). */
+#define AUTO_DRY_TEMP_C           55.0f
+/** @brief Tiempo de tostado en modo automático para café muy seco (s). */
+#define AUTO_DRY_TIME_S           (7 * 60)
+
+/* =======================================================================
+ * REGISTRO Y ARCHIVOS EN TARJETA SD
+ * ======================================================================= */
+
+/** @brief Punto de montaje del sistema de archivos VFS FAT. */
+#define MOUNT_POINT               "/sdcard"
+/** @brief Ruta del archivo CSV donde se registran los inicios de sesión. */
+#define SESSIONS_FILE             MOUNT_POINT "/sesiones.csv"
+/** @brief Ruta del archivo CSV donde se registran las lecturas periódicas de temperatura. */
+#define TEMPS_FILE                MOUNT_POINT "/temperaturas.csv"
+/** @brief Intervalo de muestreo de temperatura a guardar en SD durante un tostado activo (segundos). */
+#define SD_SAMPLE_PERIOD_S        5
+
+/** @brief Cabecera formateada para el archivo de sesiones CSV. */
+#define SESSIONS_HEADER  "sesion_id,fecha,hora_inicio,humedad_inicio_pct,modo,temp_consigna_C,tiempo_s,tiempo_min"
+/** @brief Cabecera formateada para el archivo de muestras de temperatura CSV. */
+#define TEMPS_HEADER      "sesion_id,fecha,hora,temperatura_C"
+
+/** @brief Longitud máxima de las colas de mensajes FreeRTOS. */
+#define QUEUE_LEN                 10
+/** @brief Permite forzar la configuración del RTC al arrancar el sistema si está en 1. */
+#define SET_RTC_TIME_ON_BOOT      0
+
+/* =======================================================================
+ * TIPOS DE DATOS Y ESTRUCTURAS
+ * ======================================================================= */
+
+/**
+ * @brief Estados del ciclo de vida del proceso de tostado.
+ */
+typedef enum {
+    ROAST_IDLE = 0,    /**< Sistema en reposo, salidas apagadas. */
+    ROAST_RUNNING,     /**< Proceso de tostado activo en ejecución. */
+    ROAST_DONE         /**< Proceso finalizado exitosamente. */
+} roast_state_t;
+
+/**
+ * @brief Modos de operación del tostador.
+ */
+typedef enum {
+    ROAST_MODE_NONE = 0,  /**< Ningún modo seleccionado. */
+    ROAST_MODE_MANUAL,    /**< Parámetros configurados manualmente por el usuario. */
+    ROAST_MODE_AUTO       /**< Parámetros automáticos calculados según la humedad ambiental. */
+} roast_mode_t;
+
+/**
+ * @brief Clasificación de la humedad ambiental para los perfiles de tostado.
+ */
+typedef enum {
+    HUM_DRY = 0,  /**< Humedad baja (Grano muy seco). */
+    HUM_IDEAL,    /**< Humedad óptima de almacenamiento. */
+    HUM_WET       /**< Humedad elevada (Grano húmedo). */
+} hum_class_t;
+
+/**
+ * @brief Estructura de paquete enviada por el puerto serie (CSV).
+ */
+typedef struct {
+    uint64_t timestamp_ms;  /**< Marca de tiempo desde el arranque en ms. */
+    char     datetime[20];  /**< Cadena con la fecha y hora formateada "YYYY-MM-DD HH:MM:SS". */
+    float    temp_max6675;  /**< Lectura del sensor de temperatura en °C. */
+    uint8_t  max_status;    /**< Estado de la termocupla (0 = OK, 1 = Abierta/Error, 2 = Fallo SPI). */
+    float    humidity_dht;  /**< Lectura de humedad relativa del DHT11 en %. */
+    uint8_t  dht_status;    /**< Estado de la lectura del DHT11 (0 = OK, 1 = Error/Timeout). */
+} datalog_entry_t;
+
+/**
+ * @brief Tipo de evento destinado a la cola de escritura de la tarjeta SD.
+ */
+typedef enum {
+    LOG_SESSION_START = 0,  /**< Registro de nuevo evento en sesiones.csv. */
+    LOG_TEMP_SAMPLE         /**< Muestra periódica de temperatura en temperaturas.csv. */
+} log_evt_type_t;
+
+/**
+ * @brief Estructura de datos enviada a la tarea de registro SD (`vTaskSDWriter`).
+ */
+typedef struct {
+    log_evt_type_t type;         /**< Tipo de registro (Inicio de sesión o Muestra). */
+    uint32_t       session_id;   /**< Identificador único consecutivo de la sesión. */
+    char           datetime[20]; /**< Marca de tiempo del RTC. */
+    
+    /* Campos exclusivos para LOG_SESSION_START */
+    float          humidity;     /**< Humedad inicial del ambiente (-1.0f si no es válida). */
+    roast_mode_t   mode;         /**< Modo de operación empleado (Manual o Automático). */
+    float          setpoint;     /**< Temperatura objetivo fijada en °C. */
+    uint32_t       total_s;      /**< Duración total programada en segundos. */
+    
+    /* Campos exclusivos para LOG_TEMP_SAMPLE */
+    float          temp;         /**< Temperatura instantánea registrada por el MAX6675. */
+    uint8_t        max_status;   /**< Código de estado del MAX6675 (0 = OK). */
+} sd_log_entry_t;
+
+/* =======================================================================
+ * VARIABLES GLOBALES Y MECANISMOS DE SINCRONIZACIÓN
+ * ======================================================================= */
+
+/** @brief Temperatura actual medida por la termocupla MAX6675. Protegida por `g_state_mutex`. */
+static float g_temp_max = 0.0f;
+/** @brief Humedad relativa actual medida por el DHT11. Protegida por `g_state_mutex`. */
+static float g_humidity_dht = 0.0f;
+/** @brief Flag de fallo de comunicación o desconexión del MAX6675. */
+static bool  g_max_error = false;
+/** @brief Flag de fallo de lectura del DHT11. */
+static bool  g_dht_error = false;
+/** @brief Flag que indica si el DHT11 ya entregó al menos una lectura válida. */
+static bool  g_dht_valid_once = false;
+
+/** @brief Estado actual del proceso de tostado. Protegido por `g_state_mutex`. */
+static roast_state_t g_roast_state = ROAST_IDLE;
+/** @brief Modo de tostado seleccionado. Protegido por `g_state_mutex`. */
+static roast_mode_t  g_roast_mode = ROAST_MODE_NONE;
+/** @brief Temperatura consigna activa en °C. */
+static float         g_setpoint = 0.0f;
+/** @brief Tiempo total del tostado en segundos. */
+static uint32_t      g_total_s = 0;
+/** @brief Segundos restantes de tostado. */
+static uint32_t      g_remaining_s = 0;
+/** @brief Indica si la temperatura de consigna ya se alcanzó por primera vez. */
+static bool          g_setpoint_reached = false;
+/** @brief Contador acumulativo de sesiones guardadas en la SD. */
+static uint32_t      g_session_id = 0;
+
+/** @brief Estado lógico demandado para el motor (true = encendido, false = apagado). */
+static bool g_motor_state = false;
+/** @brief Estado lógico demandado para el calefactor. */
+static bool g_heater_state = false;
+
+/** @brief Flag de montaje correcto de la tarjeta SD. */
+static bool sd_ok = false;
+/** @brief Cadena global con la última fecha/hora leída del RTC. Protegida por `xTimeMutex`. */
+static char shared_datetime[20] = "2026-09-29 19:07:00";
+
+/** @brief Manejador del dispositivo SPI para el MAX6675. */
+static spi_device_handle_t max6675_dev;
+
+/** @brief Mutex de protección del estado global del proceso y variables de sensores. */
+static SemaphoreHandle_t g_state_mutex = NULL;
+/** @brief Mutex de exclusión mutua para el acceso al sistema de archivos VFS de la SD. */
+static SemaphoreHandle_t xSdMutex      = NULL;
+/** @brief Mutex de protección para la lectura y escritura de la fecha/hora compartida. */
+static SemaphoreHandle_t xTimeMutex    = NULL;
+
+/** @brief Cola FreeRTOS para el envío de datos a guardar en la tarjeta SD. */
+static QueueHandle_t      xQueueSD      = NULL;
+/** @brief Cola FreeRTOS para la transmisión de registros por puerto serie. */
+static QueueHandle_t      xQueueSerial  = NULL;
+
+/* =======================================================================
+ * FUNCIONES AUXILIARES DE TIEMPO Y SENSORES
+ * ======================================================================= */
+
+/**
+ * @brief Obtiene una copia segura de la fecha y hora del RTC.
+ * 
+ * @param[out] out Puntero al búfer de caracteres de destino.
+ * @param[in]  len Tamaño máximo del búfer.
+ */
+static void get_datetime(char *out, size_t len) {
+    xSemaphoreTake(xTimeMutex, portMAX_DELAY);
+    strlcpy(out, shared_datetime, len);
+    xSemaphoreGive(xTimeMutex);
+}
+
+/**
+ * @brief Realiza la lectura del sensor DHT11 mediante temporización por software.
+ * 
+ * @param[in]  gpio Pin GPIO asignado al DHT11.
+ * @param[out] humidity Puntero donde se almacenará el porcentaje de humedad calculada.
+ * 
+ * @return esp_err_t 
+ * @retval ESP_OK Si la trama y la suma de comprobación (checksum) son correctas.
+ * @retval ESP_ERR_TIMEOUT Si el sensor no responde en los tiempos requeridos.
+ * @retval ESP_ERR_INVALID_CRC Si falla la verificación checksum.
+ */
+static esp_err_t dht11_read_humidity(gpio_num_t gpio, float *humidity) {
+    uint8_t data[5] = {0};
+
+    gpio_set_direction(gpio, GPIO_MODE_OUTPUT);
+    gpio_set_level(gpio, 0);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    gpio_set_level(gpio, 1);
+    ets_delay_us(30);
+    gpio_set_direction(gpio, GPIO_MODE_INPUT);
+
+    uint16_t timeout = 0;
+    while (gpio_get_level(gpio) == 1) {
+        if (++timeout > 100) return ESP_ERR_TIMEOUT;
+        ets_delay_us(1);
+    }
+    timeout = 0;
+    while (gpio_get_level(gpio) == 0) {
+        if (++timeout > 100) return ESP_ERR_TIMEOUT;
+        ets_delay_us(1);
+    }
+    timeout = 0;
+    while (gpio_get_level(gpio) == 1) {
+        if (++timeout > 100) return ESP_ERR_TIMEOUT;
+        ets_delay_us(1);
+    }
+
+    for (int i = 0; i < 40; i++) {
+        timeout = 0;
+        while (gpio_get_level(gpio) == 0) {
+            if (++timeout > 100) return ESP_ERR_TIMEOUT;
+            ets_delay_us(1);
+        }
+
+        uint32_t t_high = 0;
+        while (gpio_get_level(gpio) == 1) {
+            t_high++;
+            ets_delay_us(1);
+            if (t_high > 100) return ESP_ERR_TIMEOUT;
+        }
+
+        if (t_high > 40) {
+            data[i / 8] |= (1 << (7 - (i % 8)));
+        }
+    }
+
+    if (data[4] == ((data[0] + data[1] + data[2] + data[3]) & 0xFF)) {
+        *humidity = (float)data[0] + (float)data[1] * 0.1f;
+        return ESP_OK;
+    }
+
+    return ESP_ERR_INVALID_CRC;
+}
+
+/* =======================================================================
+ * CONTROL DE HARDWARE Y PERIFÉRICOS
+ * ======================================================================= */
+
+/**
+ * @brief Configura e inicializa los pines GPIO asignados a los relés de potencia.
+ */
+void init_relay_gpios(void) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = RELAY_PIN_SEL,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+    gpio_set_level(MOTOR_RELAY_PIN, 0);
+    gpio_set_level(HEATER_RELAY_PIN, 0);
+}
+
+/**
+ * @brief Inicializa los pines GPIO encargados de la señalización (Buzzer y LEDs).
+ */
+void init_indicator_gpios(void) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = INDICATOR_PIN_SEL,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+
+    gpio_set_level(BUZZER_PIN, 0);
+    gpio_set_level(LED_ACTIVE_PIN, 0);
+    gpio_set_level(LED_STOPPED_PIN, 1);
+}
+
+/**
+ * @brief Establece el estado lógico de los relés de salida.
+ * @note Esta función debe invocarse previa adquisición de `g_state_mutex`.
+ * 
+ * @param[in] motor Estado deseado para el motor (true = activo).
+ * @param[in] heater Estado deseado para el calefactor (true = activo).
+ */
+static void set_outputs_locked(bool motor, bool heater) {
+    g_motor_state = motor;
+    g_heater_state = heater;
+#if MOTOR_PULSE_ENABLE
+    if (!motor) {
+        gpio_set_level(MOTOR_RELAY_PIN, 0);
+    }
+#else
+    gpio_set_level(MOTOR_RELAY_PIN, motor ? 1 : 0);
+#endif
+    gpio_set_level(HEATER_RELAY_PIN, heater ? 1 : 0);
+}
+
+/**
+ * @brief Convierte un byte en formato BCD a Decimal.
+ */
+static inline uint8_t bcd2dec(uint8_t v) { return ((v >> 4) * 10) + (v & 0x0F); }
+
+/**
+ * @brief Convierte un byte en formato Decimal a BCD.
+ */
+static inline uint8_t dec2bcd(uint8_t v) { return ((v / 10) << 4) | (v % 10); }
+
+/**
+ * @brief Programa la hora actual en el módulo RTC DS3231 vía I2C.
+ * 
+ * @param[in] t Estructura de tiempo `tm` con la fecha y hora a programar.
+ * @return esp_err_t Resultado de la transacción I2C.
+ */
+static esp_err_t ds3231_set_time(const struct tm *t) {
+    uint8_t d[8];
+    d[0] = 0x00;
+    d[1] = dec2bcd(t->tm_sec);
+    d[2] = dec2bcd(t->tm_min);
+    d[3] = dec2bcd(t->tm_hour);
+    d[4] = dec2bcd(t->tm_wday + 1);
+    d[5] = dec2bcd(t->tm_mday);
+    d[6] = dec2bcd(t->tm_mon + 1);
+    d[7] = dec2bcd(t->tm_year % 100);
+    return i2c_master_write_to_device(I2C_NUM_0, DS3231_I2C_ADDR, d, sizeof(d), pdMS_TO_TICKS(1000));
+}
+
+/**
+ * @brief Lee la fecha y hora almacenada en el RTC DS3231.
+ * 
+ * @param[out] t Estructura `tm` donde se cargará el tiempo leído.
+ * @return esp_err_t Resultado de la transacción I2C.
+ */
+static esp_err_t ds3231_get_time(struct tm *t) {
+    uint8_t reg = 0x00;
+    uint8_t d[7];
+    esp_err_t ret = i2c_master_write_read_device(I2C_NUM_0, DS3231_I2C_ADDR, &reg, 1, d, sizeof(d), pdMS_TO_TICKS(1000));
+    if (ret != ESP_OK) return ret;
+    t->tm_sec   = bcd2dec(d[0] & 0x7F);
+    t->tm_min   = bcd2dec(d[1] & 0x7F);
+    t->tm_hour  = bcd2dec(d[2] & 0x3F);
+    t->tm_wday  = bcd2dec(d[3] & 0x07) - 1;
+    t->tm_mday  = bcd2dec(d[4] & 0x3F);
+    t->tm_mon   = bcd2dec(d[5] & 0x1F) - 1;
+    t->tm_year  = bcd2dec(d[6]) + 100;
+    return ESP_OK;
+}
+
+/**
+ * @brief Lee la temperatura mediante el módulo SPI MAX6675 con reintentos.
+ * 
+ * @param[out] temp Puntero donde se almacenará el valor en °C.
+ * @param[out] status Estado de la lectura (0 = OK, 1 = Termocupla abierta, 2 = Error de bus SPI).
+ * @return esp_err_t 
+ */
+static esp_err_t max6675_read(float *temp, uint8_t *status) {
+    uint16_t raw_data = 0;
+    uint8_t dummy_tx[2] = {0xFF, 0xFF};
+    bool valid = false;
+    uint16_t raw = 0;
+
+    for (int i = 0; i < 3 && !valid; i++) {
+        spi_transaction_t t = {
+            .length = 16,
+            .tx_buffer = dummy_tx,
+            .rx_buffer = &raw_data,
+        };
+        esp_err_t ret = spi_device_transmit(max6675_dev, &t);
+        if (ret != ESP_OK) {
+            *temp = 0.0f; *status = 2; return ret;
+        }
+        raw = __builtin_bswap16(raw_data);
+        valid = !(raw == 0x0000 || raw == 0xFFFF || (raw & 0x8000));
+        if (!valid) vTaskDelay(pdMS_TO_TICKS(220));
+    }
+
+    if (!valid) { *temp = 0.0f; *status = 2; return ESP_ERR_INVALID_RESPONSE; }
+
+    if (raw & 0x04) { *temp = 0.0f; *status = 1; }
+    else { *temp = (raw >> 3) * 0.25f; *status = 0; }
+    return ESP_OK;
+}
+
+/* =======================================================================
+ * LÓGICA DE CLASIFICACIÓN Y MODO AUTOMÁTICO
+ * ======================================================================= */
+
+/**
+ * @brief Clasifica el porcentaje de humedad medida dentro de los rangos predefinidos.
+ */
+static hum_class_t classify_humidity(float h) {
+    if (h < HUM_LIMIT_DRY) return HUM_DRY;
+    if (h > HUM_LIMIT_WET) return HUM_WET;
+    return HUM_IDEAL;
+}
+
+/**
+ * @brief Devuelve la representación textual de la categoría de humedad.
+ */
+static const char *hum_class_text(hum_class_t c) {
+    switch (c) {
+        case HUM_DRY: return "MUY SECO (<10%)";
+        case HUM_WET: return "MUY HUMEDO (>12%)";
+        default:      return "IDEAL (10%-12%)";
+    }
+}
+
+/**
+ * @brief Determina los parámetros de temperatura y tiempo para el perfil de tostado automático.
+ * 
+ * @param[in]  c Clasificación de la humedad obtenida.
+ * @param[out] temp_c Puntero a la temperatura asignada (°C).
+ * @param[out] secs Puntero al tiempo total asignado (segundos).
+ */
+static void auto_params_for(hum_class_t c, float *temp_c, uint32_t *secs) {
+    switch (c) {
+        case HUM_DRY:
+            *temp_c = AUTO_DRY_TEMP_C;
+            *secs = AUTO_DRY_TIME_S;
+            break;
+        case HUM_WET:
+            *temp_c = AUTO_WET_TEMP_C;
+            *secs = AUTO_WET_TIME_S;
+            break;
+        default:
+            *temp_c = AUTO_IDEAL_TEMP_C;
+            *secs = AUTO_IDEAL_TIME_S;
+            break;
+    }
+}
+
+/* =======================================================================
+ * MANEJO DE ARCHIVOS CSV EN TARJETA SD
+ * ======================================================================= */
+
+/**
+ * @brief Escribe la cabecera CSV si el archivo especificado no existe o se encuentra vacío.
+ */
+static void sd_write_header_if_empty(const char *path, const char *header) {
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size == 0) {
+        FILE *f = fopen(path, "a");
+        if (f) {
+            fprintf(f, "%s\n", header);
+            fclose(f);
+        } else {
+            ESP_LOGE(TAG, "No se pudo crear %s", path);
+        }
+    }
+}
+
+/**
+ * @brief Prepara los archivos de registro y escanea el mayor ID de sesión registrado.
+ * 
+ * @return uint32_t El identificador más alto de sesión para mantener el consecutivo tras reinicios.
+ */
+static uint32_t sd_prepare_files(void) {
+    sd_write_header_if_empty(SESSIONS_FILE, SESSIONS_HEADER);
+    sd_write_header_if_empty(TEMPS_FILE, TEMPS_HEADER);
+
+    uint32_t max_id = 0;
+    FILE *f = fopen(SESSIONS_FILE, "r");
+    if (f) {
+        char line[160];
+        while (fgets(line, sizeof(line), f)) {
+            uint32_t v = (uint32_t)strtoul(line, NULL, 10);
+            if (v > max_id) max_id = v;
+        }
+        fclose(f);
+    }
+    return max_id;
+}
+
+/**
+ * @brief Formatea los datos de una nueva sesión de tostado en una línea CSV.
+ */
+static void format_session_csv(const sd_log_entry_t *e, char *out, size_t len) {
+    char hum[12];
+    if (e->humidity < 0.0f) {
+        strlcpy(hum, "NA", sizeof(hum));
+    } else {
+        snprintf(hum, sizeof(hum), "%.1f", e->humidity);
+    }
+    snprintf(out, len, "%lu,%.10s,%s,%s,%s,%.1f,%lu,%.2f",
+             (unsigned long)e->session_id,
+             e->datetime,
+             e->datetime + 11,
+             hum,
+             (e->mode == ROAST_MODE_AUTO) ? "AUTOMATICO" : "MANUAL",
+             e->setpoint,
+             (unsigned long)e->total_s,
+             (float)e->total_s / 60.0f);
+}
+
+/**
+ * @brief Formatea una muestra instantánea de temperatura en una línea CSV.
+ */
+static void format_sample_csv(const sd_log_entry_t *e, char *out, size_t len) {
+    char temp[12];
+    if (e->max_status != 0) {
+        strlcpy(temp, "ERR", sizeof(temp));
+    } else {
+        snprintf(temp, sizeof(temp), "%.2f", e->temp);
+    }
+    snprintf(out, len, "%lu,%.10s,%s,%s",
+             (unsigned long)e->session_id,
+             e->datetime,
+             e->datetime + 11,
+             temp);
+}
+
+/* =======================================================================
+ * INTERFAZ WEB HTML Y MANEJADORES HTTP REST
+ * ======================================================================= */
+
+/** @brief Código fuente del panel de control Web incrustado en HTML/JavaScript. */
+static const char html_page[] =
+"<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+"<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+"<title>Control de Tostado ESP32</title>"
+"<style>"
+"body { font-family: Arial, sans-serif; background: #121212; color: #fff; text-align: center; margin: 0; padding: 20px; }"
+".card { background: #1e1e1e; padding: 20px; border-radius: 12px; margin: 15px auto; max-width: 420px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }"
+"h1 { color: #ff9800; font-size: 22px; }"
+".grid { display: flex; justify-content: space-around; gap: 10px; }"
+".box { flex: 1; background: #2a2a2a; padding: 12px; border-radius: 8px; }"
+".val { font-size: 28px; font-weight: bold; margin: 5px 0; }"
+".temp-color { color: #00e676; }"
+".hum-color { color: #00bcd4; }"
+".time-txt { font-size: 22px; color: #03a9f4; font-weight: bold; margin-top: 5px; }"
+".btn { background: #333; color: white; border: none; padding: 12px 20px; margin: 5px; font-size: 16px; border-radius: 6px; cursor: pointer; transition: 0.3s; }"
+".btn:hover { background: #555; }"
+".btn-active { background: #2196f3; font-weight: bold; }"
+".btn-on { background: #4caf50; }"
+".btn-off { background: #f44336; }"
+".btn:disabled { opacity: 0.4; cursor: not-allowed; }"
+".status-badge { display: inline-block; padding: 6px 12px; border-radius: 12px; font-size: 13px; margin-top: 5px; font-weight: bold; }"
+".badge-on { background: #2e7d32; color: #fff; }"
+".badge-off { background: #c62828; color: #fff; }"
+".badge-err { background: #d32f2f; color: #fff; }"
+".badge-warn { background: #ef6c00; color: #fff; }"
+".note { background: #2a2a2a; border-left: 4px solid #ff9800; padding: 10px; border-radius: 6px; font-size: 14px; text-align: left; margin-bottom: 12px; }"
+"label { display: block; margin-top: 10px; font-size: 14px; color: #bbb; }"
+"input[type=number] { width: 140px; padding: 10px; font-size: 18px; text-align: center; border-radius: 6px; border: 1px solid #555; background: #2a2a2a; color: #fff; margin-top: 4px; }"
+"input:disabled { opacity: 0.4; }"
+".info-line { margin-top: 8px; font-size: 14px; color: #ddd; }"
+"</style></head><body>"
+"<h1>Control de Tostado de Café</h1>"
+
+"<div class='card'>"
+"  <div>Hora del Sistema (RTC)</div>"
+"  <div class='time-txt' id='rtc-time'>--:--:--</div>"
+"</div>"
+
+"<div class='card'>"
+"  <h3>Mediciones Ambientales</h3>"
+"  <div class='grid'>"
+"    <div class='box'>"
+"      <small>Temp. Termocupla</small>"
+"      <div class='val temp-color' id='temp-max'>--.- °C</div>"
+"      <div id='st-max'></div>"
+"    </div>"
+"    <div class='box'>"
+"      <small>Humedad Aire (DHT11)</small>"
+"      <div class='val hum-color' id='hum-dht'>-- %</div>"
+"      <div id='st-dht'></div>"
+"    </div>"
+"  </div>"
+"</div>"
+
+"<div class='card'>"
+"  <h3>Proceso de Tostado</h3>"
+"  <div class='note'>El proceso de tostado está calibrado para <b>100 gramos</b> de la especie <b>Café Arábigo (Coffea arabica)</b>.</div>"
+"  <button id='tab-manual' class='btn btn-active' onclick='showTab(`manual`)'>Manual</button>"
+"  <button id='tab-auto' class='btn' onclick='showTab(`auto`)'>Automático</button>"
+
+"  <div id='panel-manual'>"
+"    <label>Temperatura de tostado (°C)</label>"
+"    <input type='number' id='in-temp' value='70' min='30' max='250' step='1'>"
+"    <label>Tiempo de tostado (minutos)</label>"
+"    <input type='number' id='in-time' value='5' min='1' max='120' step='0.5'><br><br>"
+"    <button id='btn-start-manual' class='btn btn-on' onclick='startManual()'>Iniciar</button>"
+"  </div>"
+
+"  <div id='panel-auto' style='display:none'>"
+"    <div class='info-line'>Humedad actual: <b id='auto-hum'>--</b></div>"
+"    <div class='info-line'>Parámetros según humedad:<br><b id='auto-params'>--</b></div><br>"
+"    <button id='btn-start-auto' class='btn btn-on' onclick='startAuto()'>Iniciar</button>"
+"  </div>"
+"</div>"
+
+"<div class='card'>"
+"  <h3>Estado del Proceso</h3>"
+"  <span id='proc-state' class='status-badge badge-off'>DETENIDO</span>"
+"  <div class='info-line' id='proc-info'>-</div>"
+"  <div class='time-txt' id='proc-remaining'>--:--</div>"
+"  <button id='btn-stop' class='btn btn-off' onclick='stopRoast()' disabled>Detener</button>"
+"</div>"
+
+"<script>"
+"let currentTab = 'manual';"
+"let prevState = 'IDLE';"
+"function showTab(t) {"
+"  currentTab = t;"
+"  document.getElementById('panel-manual').style.display = (t === 'manual') ? 'block' : 'none';"
+"  document.getElementById('panel-auto').style.display = (t === 'auto') ? 'block' : 'none';"
+"  document.getElementById('tab-manual').className = 'btn ' + (t === 'manual' ? 'btn-active' : '');"
+"  document.getElementById('tab-auto').className = 'btn ' + (t === 'auto' ? 'btn-active' : '');"
+"}"
+"function fmt(s) {"
+"  s = Math.max(0, Math.round(s));"
+"  let m = Math.floor(s / 60), r = s % 60;"
+"  return String(m).padStart(2, '0') + ':' + String(r).padStart(2, '0');"
+"}"
+"async function api(url) {"
+"  try {"
+"    let r = await fetch(url);"
+"    let j = await r.json();"
+"    if (!j.ok) alert(j.msg);"
+"  } catch(e) { alert('Error de comunicación con el equipo'); }"
+"  updateStatus();"
+"}"
+"function startManual() {"
+"  let t = parseFloat(document.getElementById('in-temp').value);"
+"  let m = parseFloat(document.getElementById('in-time').value);"
+"  if (isNaN(t) || isNaN(m)) { alert('Ingresa una temperatura y un tiempo válidos'); return; }"
+"  api('/api/start?mode=manual&temp=' + t + '&time=' + Math.round(m * 60));"
+"}"
+"function startAuto() { api('/api/start?mode=auto'); }"
+"function stopRoast() { api('/api/stop'); }"
+"async function updateStatus() {"
+"  try {"
+"    let res = await fetch('/api/status');"
+"    let data = await res.json();"
+"    document.getElementById('rtc-time').innerText = data.rtc_time;"
+"    if (data.max_err) {"
+"      document.getElementById('temp-max').innerText = 'ERR';"
+"      document.getElementById('st-max').innerHTML = `<span class='status-badge badge-err'>Error MAX</span>`;"
+"    } else {"
+"      document.getElementById('temp-max').innerText = data.temp_max.toFixed(1) + ' °C';"
+"      document.getElementById('st-max').innerText = '';"
+"    }"
+"    if (data.dht_err) {"
+"      document.getElementById('hum-dht').innerText = 'ERR';"
+"      document.getElementById('st-dht').innerHTML = `<span class='status-badge badge-err'>Error DHT</span>`;"
+"      document.getElementById('auto-hum').innerText = 'Sin lectura';"
+"    } else {"
+"      document.getElementById('hum-dht').innerText = data.humidity.toFixed(0) + ' %';"
+"      let badgeClass = 'badge-on';"
+"      if (data.hum_state.includes('SECO')) badgeClass = 'badge-warn';"
+"      else if (data.hum_state.includes('HUMEDO')) badgeClass = 'badge-err';"
+"      document.getElementById('st-dht').innerHTML = `<span class='status-badge ${badgeClass}'>${data.hum_state}</span>`;"
+"      document.getElementById('auto-hum').innerText = data.humidity.toFixed(0) + ' % - ' + data.hum_state;"
+"    }"
+"    if (data.auto_temp > 0) {"
+"      document.getElementById('auto-params').innerText = data.auto_temp.toFixed(0) + ' °C durante ' + data.auto_min.toFixed(0) + ' min';"
+"    } else {"
+"      document.getElementById('auto-params').innerText = 'Esperando lectura de humedad...';"
+"    }"
+"    let running = (data.state === 'RUNNING');"
+"    if (running && prevState !== 'RUNNING') showTab(data.mode === 'AUTO' ? 'auto' : 'manual');"
+"    prevState = data.state;"
+"    let badge = document.getElementById('proc-state');"
+"    let info = document.getElementById('proc-info');"
+"    if (running) {"
+"      badge.className = 'status-badge badge-on';"
+"      badge.innerText = 'EN PROCESO';"
+"      info.innerText = 'Modo ' + (data.mode === 'AUTO' ? 'Automático' : 'Manual') + ' | Objetivo: ' + data.setpoint.toFixed(0) + ' °C | Fase: ' + data.phase;"
+"      document.getElementById('proc-remaining').innerText = fmt(data.remaining_s) + ' restantes';"
+"    } else if (data.state === 'DONE') {"
+"      badge.className = 'status-badge badge-warn';"
+"      badge.innerText = 'FINALIZADO';"
+"      info.innerText = 'El tostado terminó. Motor y calefactor apagados.';"
+"      document.getElementById('proc-remaining').innerText = '00:00';"
+"    } else {"
+"      badge.className = 'status-badge badge-off';"
+"      badge.innerText = 'DETENIDO';"
+"      info.innerText = 'Sin proceso activo.';"
+"      document.getElementById('proc-remaining').innerText = '--:--';"
+"    }"
+"    document.getElementById('btn-start-manual').disabled = running;"
+"    document.getElementById('btn-start-auto').disabled = running;"
+"    document.getElementById('in-temp').disabled = running;"
+"    document.getElementById('in-time').disabled = running;"
+"    document.getElementById('btn-stop').disabled = !running;"
+"  } catch(e) { console.error(e); }"
+"}"
+"setInterval(updateStatus, 1500);"
+"updateStatus();"
+"</script></body></html>";
+
+/**
+ * @brief Envía una respuesta HTTP en formato JSON.
+ */
+static esp_err_t reply_json(httpd_req_t *req, const char *status, const char *json) {
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+}
+
+/**
+ * @brief Envía una respuesta HTTP de error en formato JSON.
+ */
+static esp_err_t reply_error(httpd_req_t *req, const char *status, const char *msg) {
+    char out[192];
+    snprintf(out, sizeof(out), "{\"ok\":false,\"msg\":\"%s\"}", msg);
+    return reply_json(req, status, out);
+}
+
+/**
+ * @brief Manejador de la petición GET a la raíz (`/`). Servidor de la página Web.
+ */
+static esp_err_t root_get_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, html_page, HTTPD_RESP_USE_STRLEN);
+}
+
+/**
+ * @brief Manejador de la API `/api/status`. Proporciona el estado actual del sistema en JSON.
+ */
+static esp_err_t status_get_handler(httpd_req_t *req) {
+    char json_response[512];
+    char rtc_buf[20];
+
+    get_datetime(rtc_buf, sizeof(rtc_buf));
+
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+
+    hum_class_t hc = classify_humidity(g_humidity_dht);
+    const char *hum_state_str = hum_class_text(hc);
+
+    float auto_t = 0.0f;
+    uint32_t auto_s = 0;
+    if (g_dht_valid_once) {
+        auto_params_for(hc, &auto_t, &auto_s);
+    }
+
+    const char *state_str = "IDLE";
+    if (g_roast_state == ROAST_RUNNING) state_str = "RUNNING";
+    else if (g_roast_state == ROAST_DONE) state_str = "DONE";
+
+    const char *mode_str = "NONE";
+    if (g_roast_mode == ROAST_MODE_MANUAL) mode_str = "MANUAL";
+    else if (g_roast_mode == ROAST_MODE_AUTO) mode_str = "AUTO";
+
+    const char *phase_str = "-";
+    if (g_roast_state == ROAST_RUNNING) {
+        if (g_max_error) phase_str = "ERROR SENSOR";
+        else if (!g_setpoint_reached) phase_str = "CALENTANDO";
+        else phase_str = "MANTENIENDO";
+    }
+
+    snprintf(json_response, sizeof(json_response),
+             "{\"temp_max\":%.2f,\"max_err\":%s,\"humidity\":%.1f,\"dht_err\":%s,\"hum_state\":\"%s\","
+             "\"state\":\"%s\",\"mode\":\"%s\",\"phase\":\"%s\",\"setpoint\":%.1f,"
+             "\"total_s\":%lu,\"remaining_s\":%lu,\"auto_temp\":%.1f,\"auto_min\":%.1f,\"rtc_time\":\"%s\"}",
+             g_temp_max, g_max_error ? "true" : "false",
+             g_humidity_dht, g_dht_error ? "true" : "false",
+             hum_state_str,
+             state_str, mode_str, phase_str, g_setpoint,
+             (unsigned long)g_total_s, (unsigned long)g_remaining_s,
+             auto_t, (float)auto_s / 60.0f,
+             rtc_buf);
+    xSemaphoreGive(g_state_mutex);
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, json_response, HTTPD_RESP_USE_STRLEN);
+}
+
+/**
+ * @brief Manejador de la API `/api/start`. Inicia el proceso de tostado (Manual o Automático).
+ */
+static esp_err_t start_handler(httpd_req_t *req) {
+    char buf[96] = {0};
+    char mode_str[12] = {0}, temp_str[16] = {0}, time_str[16] = {0};
+
+    if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) != ESP_OK ||
+        httpd_query_key_value(buf, "mode", mode_str, sizeof(mode_str)) != ESP_OK) {
+        return reply_error(req, "400 Bad Request", "Solicitud inválida");
+    }
+
+    roast_mode_t mode;
+    float temp_c = 0.0f;
+    uint32_t secs = 0;
+
+    if (strcmp(mode_str, "manual") == 0) {
+        mode = ROAST_MODE_MANUAL;
+        if (httpd_query_key_value(buf, "temp", temp_str, sizeof(temp_str)) != ESP_OK ||
+            httpd_query_key_value(buf, "time", time_str, sizeof(time_str)) != ESP_OK) {
+            return reply_error(req, "400 Bad Request", "Faltan la temperatura o el tiempo");
+        }
+        temp_c = strtof(temp_str, NULL);
+        long t = strtol(time_str, NULL, 10);
+        if (temp_c < ROAST_TEMP_MIN_C || temp_c > ROAST_TEMP_MAX_C) {
+            return reply_error(req, "400 Bad Request", "Temperatura fuera de rango (30 a 250 °C)");
+        }
+        if (t < ROAST_TIME_MIN_S || t > ROAST_TIME_MAX_S) {
+            return reply_error(req, "400 Bad Request", "Tiempo fuera de rango (10 s a 120 min)");
+        }
+        secs = (uint32_t)t;
+    } else if (strcmp(mode_str, "auto") == 0) {
+        mode = ROAST_MODE_AUTO;
+    } else {
+        return reply_error(req, "400 Bad Request", "Modo desconocido");
+    }
+
+    const char *err = NULL;
+
+    char start_dt[20];
+    get_datetime(start_dt, sizeof(start_dt));
+
+    sd_log_entry_t ev = {0};
+    bool session_started = false;
+
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    if (g_roast_state == ROAST_RUNNING) {
+        err = "Ya hay un proceso en marcha";
+    } else if (g_max_error) {
+        err = "Error en la termocupla MAX6675, no se puede iniciar";
+    } else if (mode == ROAST_MODE_AUTO && !g_dht_valid_once) {
+        err = "Aún no hay lectura válida de humedad";
+    } else {
+        if (mode == ROAST_MODE_AUTO) {
+            auto_params_for(classify_humidity(g_humidity_dht), &temp_c, &secs);
+        }
+        g_roast_mode = mode;
+        g_setpoint = temp_c;
+        g_total_s = secs;
+        g_remaining_s = secs;
+        g_setpoint_reached = false;
+        g_session_id++;
+        g_roast_state = ROAST_RUNNING;
+
+        set_outputs_locked(true, true);
+
+        ev.type = LOG_SESSION_START;
+        ev.session_id = g_session_id;
+        strlcpy(ev.datetime, start_dt, sizeof(ev.datetime));
+        ev.humidity = g_dht_valid_once ? g_humidity_dht : -1.0f;
+        ev.mode = mode;
+        ev.setpoint = temp_c;
+        ev.total_s = secs;
+        session_started = true;
+    }
+    xSemaphoreGive(g_state_mutex);
+
+    if (err) {
+        return reply_error(req, "409 Conflict", err);
+    }
+
+    if (sd_ok && session_started) {
+        if (xQueueSend(xQueueSD, &ev, pdMS_TO_TICKS(100)) != pdTRUE) {
+            ESP_LOGW(TAG, "Cola SD llena: no se registró el inicio de la sesión %lu",
+                     (unsigned long)ev.session_id);
+        }
+    }
+
+    ESP_LOGI(TAG, "Tostado iniciado (sesión %lu): %s, %.1f C, %lu s",
+             (unsigned long)ev.session_id,
+             (mode == ROAST_MODE_AUTO) ? "AUTO" : "MANUAL", temp_c, (unsigned long)secs);
+    return reply_json(req, "200 OK", "{\"ok\":true}");
+}
+
+/**
+ * @brief Manejador de la API `/api/stop`. Detiene inmediatamente el tostado activo.
+ */
+static esp_err_t stop_handler(httpd_req_t *req) {
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    set_outputs_locked(false, false);
+    g_roast_state = ROAST_IDLE;
+    g_roast_mode = ROAST_MODE_NONE;
+    g_remaining_s = 0;
+    g_setpoint_reached = false;
+    xSemaphoreGive(g_state_mutex);
+
+    ESP_LOGI(TAG, "Tostado detenido por el usuario.");
+    return reply_json(req, "200 OK", "{\"ok\":true}");
+}
+
+/**
+ * @brief Inicializa el servidor Web HTTP de ESP-IDF y registra los puntos de acceso API.
+ * 
+ * @return httpd_handle_t Manejador de la instancia del servidor HTTP.
+ */
+httpd_handle_t start_webserver(void) {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.stack_size = 8192;
+    httpd_handle_t server = NULL;
+
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t uri_root = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler };
+        httpd_uri_t uri_status = { .uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler };
+        httpd_uri_t uri_start = { .uri = "/api/start", .method = HTTP_GET, .handler = start_handler };
+        httpd_uri_t uri_stop = { .uri = "/api/stop", .method = HTTP_GET, .handler = stop_handler };
+
+        httpd_register_uri_handler(server, &uri_root);
+        httpd_register_uri_handler(server, &uri_status);
+        httpd_register_uri_handler(server, &uri_start);
+        httpd_register_uri_handler(server, &uri_stop);
+    }
+    return server;
+}
+
+/**
+ * @brief Controlador de eventos para el subsistema Wi-Fi e IP.
+ */
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "Conectado a Wi-Fi. Ingresa a: http://" IPSTR, IP2STR(&event->ip_info.ip));
+    }
+}
+
+/**
+ * @brief Inicializa la interfaz de red Wi-Fi en modo Estación (STA).
+ */
+void wifi_init_sta(void) {
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+/* =======================================================================
+ * TAREAS FREERTOS
+ * ======================================================================= */
+
+/**
+ * @brief Tarea FreeRTOS para la lectura periódica (1 Hz) del RTC DS3231.
+ */
+static void vTaskRTC(void *pv) {
+    struct tm t;
+    char buf[20];
+    while (1) {
+        if (ds3231_get_time(&t) == ESP_OK) {
+            strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
+            xSemaphoreTake(xTimeMutex, portMAX_DELAY);
+            strlcpy(shared_datetime, buf, sizeof(shared_datetime));
+            xSemaphoreGive(xTimeMutex);
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+#if MOTOR_PULSE_ENABLE
+/**
+ * @brief Tarea FreeRTOS para la modulación por ancho de pulso del relé del motor.
+ */
+static void vTaskMotorPulse(void *pv) {
+    TickType_t last_wake = xTaskGetTickCount();
+    uint32_t phase_ms = 0;
+    bool prev_enabled = false;
+
+    while (1) {
+        xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+        bool enabled = g_motor_state;
+
+        if (!enabled) {
+            gpio_set_level(MOTOR_RELAY_PIN, 0);
+            phase_ms = 0;
+        } else {
+            if (!prev_enabled) {
+                phase_ms = 0;
+            }
+            gpio_set_level(MOTOR_RELAY_PIN, (phase_ms < MOTOR_PULSE_ON_MS) ? 1 : 0);
+            phase_ms = (phase_ms + MOTOR_PULSE_STEP_MS) % MOTOR_PULSE_PERIOD_MS;
+        }
+        xSemaphoreGive(g_state_mutex);
+
+        prev_enabled = enabled;
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(MOTOR_PULSE_STEP_MS));
+    }
+}
+#endif
+
+/**
+ * @brief Tarea FreeRTOS principal de lectura de sensores y bucle de control térmico.
+ */
+static void vTaskSensorAndControl(void *pv) {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    TickType_t last_wake = xTaskGetTickCount();
+    uint8_t  loop_counter = 0;
+    uint8_t  sd_sample_tick = 0;
+    uint32_t last_logged_session = 0;
+
+    while (1) {
+        float temp_max = 0.0f;
+        uint8_t max_st = 0;
+
+        float hum_dht = 0.0f;
+        uint8_t dht_st = 0;
+
+        /* 1. Lectura MAX6675 */
+        max6675_read(&temp_max, &max_st);
+
+        /* 2. Lectura DHT11 */
+        esp_err_t dht_res = dht11_read_humidity(DHT11_PIN, &hum_dht);
+
+        xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+
+        g_max_error = (max_st != 0);
+        if (!g_max_error) {
+            g_temp_max = temp_max;
+        }
+
+        if (dht_res == ESP_OK) {
+            g_humidity_dht = hum_dht;
+            g_dht_valid_once = true;
+            g_dht_error = false;
+            dht_st = 0;
+        } else {
+            g_dht_error = !g_dht_valid_once;
+            dht_st = 1;
+        }
+
+        bool     log_active  = (g_roast_state == ROAST_RUNNING);
+        uint32_t log_session = g_session_id;
+
+        /* 3. Control del proceso de tostado */
+        if (g_roast_state == ROAST_RUNNING) {
+            bool heater = g_heater_state;
+
+            if (g_max_error) {
+                heater = false;
+            } else {
+                if (g_temp_max >= g_setpoint) {
+                    g_setpoint_reached = true;
+                }
+                if (g_temp_max >= g_setpoint + ROAST_HYSTERESIS_C) {
+                    heater = false;
+                } else if (g_temp_max <= g_setpoint - ROAST_HYSTERESIS_C) {
+                    heater = true;
+                }
+            }
+            set_outputs_locked(true, heater);
+
+            bool count_time = (!ROAST_TIMER_FROM_SETPOINT) || g_setpoint_reached;
+            if (count_time && g_remaining_s > 0) {
+                g_remaining_s--;
+            }
+            if (g_remaining_s == 0) {
+                set_outputs_locked(false, false);
+                g_roast_state = ROAST_DONE;
+                ESP_LOGI(TAG, "Tostado finalizado.");
+            }
+        }
+
+        float current_hum = g_humidity_dht;
+        xSemaphoreGive(g_state_mutex);
+
+        /* 4a. Transmisión por puerto serie (Cada 5 segundos) */
+        loop_counter++;
+        if (loop_counter >= 5) {
+            loop_counter = 0;
+
+            datalog_entry_t s = {0};
+            s.timestamp_ms = esp_timer_get_time() / 1000;
+            get_datetime(s.datetime, sizeof(s.datetime));
+
+            s.temp_max6675 = temp_max;
+            s.max_status = max_st;
+            s.humidity_dht = current_hum;
+            s.dht_status = dht_st;
+
+            xQueueSend(xQueueSerial, &s, pdMS_TO_TICKS(50));
+        }
+
+        /* 4b. Guardado en Tarjeta SD */
+        if (sd_ok && log_active) {
+            if (log_session != last_logged_session) {
+                last_logged_session = log_session;
+                sd_sample_tick = 0;
+            }
+            if (sd_sample_tick == 0) {
+                sd_log_entry_t e = {0};
+                e.type = LOG_TEMP_SAMPLE;
+                e.session_id = log_session;
+                get_datetime(e.datetime, sizeof(e.datetime));
+                e.temp = temp_max;
+                e.max_status = max_st;
+                xQueueSend(xQueueSD, &e, pdMS_TO_TICKS(50));
+            }
+            sd_sample_tick = (sd_sample_tick + 1) % SD_SAMPLE_PERIOD_S;
+        }
+
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(1000));
+    }
+}
+
+/**
+ * @brief Tarea FreeRTOS para la gestión de los indicadores luminosos y sonoros.
+ */
+static void vTaskIndicators(void *pv) {
+    const uint32_t half_ticks = BUZZER_HALF_PERIOD_MS / INDICATOR_TASK_PERIOD_MS;
+    uint32_t tick = 0;
+
+    while (1) {
+        xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+        bool running = (g_roast_state == ROAST_RUNNING);
+        xSemaphoreGive(g_state_mutex);
+
+        if (running) {
+            bool buzzer_on = ((tick / half_ticks) % 2) == 0;
+            tick++;
+
+            gpio_set_level(BUZZER_PIN, buzzer_on ? 1 : 0);
+            gpio_set_level(LED_ACTIVE_PIN, 1);
+            gpio_set_level(LED_STOPPED_PIN, 0);
+        } else {
+            tick = 0;
+            gpio_set_level(BUZZER_PIN, 0);
+            gpio_set_level(LED_ACTIVE_PIN, 0);
+            gpio_set_level(LED_STOPPED_PIN, 1);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(INDICATOR_TASK_PERIOD_MS));
+    }
+}
+
+/**
+ * @brief Convierte la trama de datos del puerto serie a cadena CSV.
+ */
+static void format_csv(const datalog_entry_t *d, char *out, size_t len) {
+    snprintf(out, len, "%llu,%s,%.2f,%u,%.1f,%u",
+             (unsigned long long)d->timestamp_ms, d->datetime,
+             d->temp_max6675, (unsigned)d->max_status,
+             d->humidity_dht, (unsigned)d->dht_status);
+}
+
+/**
+ * @brief Tarea FreeRTOS encargada de la escritura física en la tarjeta SD.
+ */
+static void vTaskSDWriter(void *pv) {
+    sd_log_entry_t e;
+    char line[160];
+
+    while (1) {
+        if (xQueueReceive(xQueueSD, &e, portMAX_DELAY) == pdTRUE) {
+            const char *path;
+            if (e.type == LOG_SESSION_START) {
+                format_session_csv(&e, line, sizeof(line));
+                path = SESSIONS_FILE;
+            } else {
+                format_sample_csv(&e, line, sizeof(line));
+                path = TEMPS_FILE;
+            }
+
+            xSemaphoreTake(xSdMutex, portMAX_DELAY);
+            FILE *f = fopen(path, "a");
+            if (f) {
+                fprintf(f, "%s\n", line);
+                fclose(f);
+            } else {
+                ESP_LOGE(TAG, "No se pudo abrir %s", path);
+            }
+            xSemaphoreGive(xSdMutex);
+        }
+    }
+}
+
+/**
+ * @brief Tarea FreeRTOS para la salida de depuración por la consola Serie en tiempo real.
+ */
+static void vTaskSerial(void *pv) {
+    datalog_entry_t d;
+    char line[140];
+    printf("timestamp_ms,datetime,temp_max6675,estado_max,humedad_dht11,estado_dht\n");
+    while (1) {
+        if (xQueueReceive(xQueueSerial, &d, portMAX_DELAY) == pdTRUE) {
+            format_csv(&d, line, sizeof(line));
+            printf("%s\n", line);
+        }
+    }
+}
+
+/* =======================================================================
+ * PUNTO DE ENTRADA PRINCIPAL (app_main)
+ * ======================================================================= */
+
+/**
+ * @brief Función de inicio del firmware ESP-IDF.
+ * @details Inicializa la memoria NVS, primitivas de sincronización FreeRTOS, GPIOs,
+ *          buses I2C y SPI (SD y MAX6675), VFS FAT, subsistema Wi-Fi, Servidor Web
+ *          y lanza las tareas concurrentes.
+ */
+void app_main(void) {
+    esp_log_level_set(TAG, ESP_LOG_INFO);
+
+    /* 1. Inicialización de Memoria NVS y Mutex/Colas FreeRTOS */
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    g_state_mutex = xSemaphoreCreateMutex();
+    xSdMutex      = xSemaphoreCreateMutex();
+    xTimeMutex    = xSemaphoreCreateMutex();
+    xQueueSD      = xQueueCreate(QUEUE_LEN, sizeof(sd_log_entry_t));
+    xQueueSerial  = xQueueCreate(QUEUE_LEN, sizeof(datalog_entry_t));
+
+    /* 2. Inicialización de GPIOs (Relés, Indicadores y DHT11) */
+    init_relay_gpios();
+    init_indicator_gpios();
+    gpio_reset_pin(DHT11_PIN);
+
+    /* 3. Inicialización del Bus I2C (RTC DS3231) */
+    i2c_config_t i2c_bus_cfg = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_SDA_PIN,
+        .scl_io_num = I2C_SCL_PIN,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 100000,
+    };
+    ESP_ERROR_CHECK(i2c_param_config(I2C_NUM_0, &i2c_bus_cfg));
+    ESP_ERROR_CHECK(i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0));
+
+#if SET_RTC_TIME_ON_BOOT
+    struct tm init_time = {
+        .tm_year = 2026 - 1900,
+        .tm_mon  = 9,
+        .tm_mday = 4,
+        .tm_hour = 11,
+        .tm_min  = 22,
+        .tm_sec  = 0,
+        .tm_wday = 2
+    };
+    ds3231_set_time(&init_time);
+#endif
+
+    /* 4. Inicialización Bus SPI 1: Tarjeta SD (SPI2_HOST) */
+    spi_bus_config_t sd_bus_cfg = {
+        .mosi_io_num = PIN_SD_MOSI,
+        .miso_io_num = PIN_SD_MISO,
+        .sclk_io_num = PIN_SD_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4096,
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &sd_bus_cfg, SDSPI_DEFAULT_DMA));
+
+    /* 5. Inicialización Bus SPI 2: Termocupla MAX6675 (SPI3_HOST) */
+    spi_bus_config_t max_bus_cfg = {
+        .mosi_io_num = -1,
+        .miso_io_num = PIN_MAX_MISO,
+        .sclk_io_num = PIN_MAX_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 0,
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &max_bus_cfg, SPI_DMA_DISABLED));
+
+    spi_device_interface_config_t max_cfg = {
+        .clock_speed_hz = 100 * 1000,
+        .mode = 0,
+        .spics_io_num = PIN_CS_MAX6675,
+        .queue_size = 1,
+    };
+    ESP_ERROR_CHECK(spi_bus_add_device(SPI3_HOST, &max_cfg, &max6675_dev));
+
+    /* 6. Montaje del Sistema de Archivos VFS FAT en la Tarjeta SD */
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = false,
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024,
+    };
+    sdmmc_card_t *card;
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = SPI2_HOST;
+    host.max_freq_khz = 4000;
+
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = PIN_CS_SD;
+    slot_config.host_id = SPI2_HOST;
+
+    if (esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot_config, &mount_config, &card) == ESP_OK) {
+        sd_ok = true;
+        ESP_LOGI(TAG, "SD montada correctamente.");
+
+        g_session_id = sd_prepare_files();
+        ESP_LOGI(TAG, "Última sesión registrada en SD: %lu", (unsigned long)g_session_id);
+    } else {
+        ESP_LOGE(TAG, "Fallo al montar SD.");
+    }
+
+    /* 7. Arranque del Servidor Web y Tareas FreeRTOS */
+    wifi_init_sta();
+    start_webserver();
+
+    xTaskCreate(vTaskRTC, "rtc_task", 3072, NULL, 3, NULL);
+    xTaskCreate(vTaskSensorAndControl, "sensor_control_task", 4096, NULL, 5, NULL);
+    xTaskCreate(vTaskSerial, "serial_task", 3072, NULL, 3, NULL);
+    xTaskCreate(vTaskIndicators, "indicator_task", 2048, NULL, 2, NULL);
+
+#if MOTOR_PULSE_ENABLE
+    xTaskCreate(vTaskMotorPulse, "motor_pulse_task", 2048, NULL, 4, NULL);
+#endif
+
+    if (sd_ok) {
+        xTaskCreate(vTaskSDWriter, "sd_task", 5120, NULL, 4, NULL);
+    }
+}
