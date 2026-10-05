@@ -1,0 +1,1258 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <sys/stat.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/queue.h"
+
+#include "driver/spi_master.h"
+#include "driver/gpio.h"
+#include "driver/i2c.h"
+#include "driver/sdspi_host.h"
+
+#include "esp_log.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "esp_http_server.h"
+#include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
+#include "esp_timer.h"
+#include "rom/ets_sys.h"
+
+static const char *TAG = "THERMO_RTC_SD_WEB";
+
+// --- Configuración Wi-Fi Station ---
+#define WIFI_SSID      "RANGER"
+#define WIFI_PASS      "Colombia1989@"
+
+// --- Configuración de Pines ---
+// Relé del MOTOR del barril/tambor de la tostadora
+#define MOTOR_RELAY_PIN   GPIO_NUM_26
+// Relé de la FUENTE DE CALOR (calefactor)
+#define HEATER_RELAY_PIN  GPIO_NUM_25
+#define RELAY_PIN_SEL     ((1ULL << MOTOR_RELAY_PIN) | (1ULL << HEATER_RELAY_PIN))
+
+#define DHT11_PIN      GPIO_NUM_32
+
+#define PIN_SD_MISO       19
+#define PIN_SD_MOSI       23
+#define PIN_SD_CLK        18
+#define PIN_CS_SD         5
+
+#define PIN_MAX_MISO      27
+#define PIN_MAX_CLK       14
+#define PIN_CS_MAX6675    4
+
+#define I2C_SDA_PIN       21
+#define I2C_SCL_PIN       22
+#define DS3231_I2C_ADDR   0x68
+
+// --- Indicadores de estado ---
+#define BUZZER_PIN        GPIO_NUM_33   // Buzzer (activo = intermitente)
+#define LED_ACTIVE_PIN    GPIO_NUM_17   // LED rojo: proceso activo
+#define LED_STOPPED_PIN   GPIO_NUM_16   // LED: proceso detenido
+#define INDICATOR_PIN_SEL ((1ULL << BUZZER_PIN) | (1ULL << LED_ACTIVE_PIN) | (1ULL << LED_STOPPED_PIN))
+
+#define BUZZER_HALF_PERIOD_MS     1000  // 1 s suena, 1 s no suena
+#define INDICATOR_TASK_PERIOD_MS  100   // Frecuencia de actualización de indicadores
+
+// --- Pulsado del motor (simula el pedal de la máquina de coser) ---
+// 1 = el relé del motor se acciona con pulsos (reduce la velocidad)
+// 0 = el relé del motor funciona de forma continua, como antes
+#define MOTOR_PULSE_ENABLE        1
+// Periodo del pulso: se genera un pulso cada 1000 ms (una vez por segundo)
+#define MOTOR_PULSE_PERIOD_MS     1000
+// Ancho del pulso (tiempo que el relé permanece activado dentro de cada periodo).
+// A MAYOR ancho -> MAYOR velocidad del motor; a MENOR ancho -> MENOR velocidad.
+// Debe ser menor que MOTOR_PULSE_PERIOD_MS. Ajustar experimentalmente.
+#define MOTOR_PULSE_ON_MS         200
+// Resolución con la que la tarea actualiza el pin (ms). Con CONFIG_FREERTOS_HZ=100 el mínimo es 10 ms.
+#define MOTOR_PULSE_STEP_MS       10
+
+// --- Parámetros del proceso de tostado ---
+// Ventana de histéresis: el calefactor se apaga a (consigna + 5) y se enciende a (consigna - 5)
+#define ROAST_HYSTERESIS_C        5.0f
+
+// 0 = el tiempo corre desde que se pulsa "Iniciar"
+// 1 = el tiempo corre solo desde que se alcanza la temperatura de consigna por primera vez
+#define ROAST_TIMER_FROM_SETPOINT 0
+
+// Límites aceptados en modo manual
+#define ROAST_TEMP_MIN_C          30.0f
+#define ROAST_TEMP_MAX_C          250.0f
+#define ROAST_TIME_MIN_S          10
+#define ROAST_TIME_MAX_S          7200
+
+// Umbrales de humedad relativa del aire (%) para clasificar el café verde
+#define HUM_LIMIT_DRY             50.0f   // por debajo: MUY SECO
+#define HUM_LIMIT_WET             65.0f   // por encima: MUY HUMEDO
+
+// Parámetros del modo automático según humedad (valores de prueba)
+#define AUTO_WET_TEMP_C           60.0f
+#define AUTO_WET_TIME_S           (5 * 60)
+#define AUTO_IDEAL_TEMP_C         65.0f
+#define AUTO_IDEAL_TIME_S         (6 * 60)
+#define AUTO_DRY_TEMP_C           55.0f
+#define AUTO_DRY_TIME_S           (7 * 60)
+
+// --- Registro en la tarjeta SD ---
+#define MOUNT_POINT           "/sdcard"
+// Un registro por cada inicio de tostado (hora, humedad, modo, temperatura y tiempo)
+#define SESSIONS_FILE         MOUNT_POINT "/sesiones.csv"
+// Una muestra cada SD_SAMPLE_PERIOD_S segundos, SOLO mientras el tostado está activo
+#define TEMPS_FILE            MOUNT_POINT "/temperaturas.csv"
+#define SD_SAMPLE_PERIOD_S    5
+
+#define SESSIONS_HEADER  "sesion_id,fecha,hora_inicio,humedad_inicio_pct,modo,temp_consigna_C,tiempo_s,tiempo_min"
+#define TEMPS_HEADER     "sesion_id,fecha,hora,temperatura_C"
+
+#define QUEUE_LEN             10
+#define SET_RTC_TIME_ON_BOOT  0
+
+typedef enum {
+    ROAST_IDLE = 0,
+    ROAST_RUNNING,
+    ROAST_DONE
+} roast_state_t;
+
+typedef enum {
+    ROAST_MODE_NONE = 0,
+    ROAST_MODE_MANUAL,
+    ROAST_MODE_AUTO
+} roast_mode_t;
+
+typedef enum {
+    HUM_DRY = 0,
+    HUM_IDEAL,
+    HUM_WET
+} hum_class_t;
+
+// Registro que se envía por el puerto serie (sin cambios)
+typedef struct {
+    uint64_t timestamp_ms;
+    char     datetime[20];
+    float    temp_max6675;
+    uint8_t  max_status;
+    float    humidity_dht;
+    uint8_t  dht_status;
+} datalog_entry_t;
+
+// Eventos que se envían a la tarea que escribe en la SD
+typedef enum {
+    LOG_SESSION_START = 0,   // Se escribe en sesiones.csv
+    LOG_TEMP_SAMPLE          // Se escribe en temperaturas.csv
+} log_evt_type_t;
+
+typedef struct {
+    log_evt_type_t type;
+    uint32_t       session_id;
+    char           datetime[20];   // "YYYY-MM-DD HH:MM:SS"
+    // Solo para LOG_SESSION_START
+    float          humidity;       // < 0 si no había lectura válida
+    roast_mode_t   mode;
+    float          setpoint;
+    uint32_t       total_s;
+    // Solo para LOG_TEMP_SAMPLE
+    float          temp;
+    uint8_t        max_status;     // 0 = OK
+} sd_log_entry_t;
+
+// Globales protegidas por Mutex (g_state_mutex)
+static float g_temp_max = 0.0f;
+static float g_humidity_dht = 0.0f;
+static bool  g_max_error = false;
+static bool  g_dht_error = false;
+static bool  g_dht_valid_once = false;   // true cuando el DHT11 ya entregó al menos una lectura válida
+
+static roast_state_t g_roast_state = ROAST_IDLE;
+static roast_mode_t  g_roast_mode = ROAST_MODE_NONE;
+static float         g_setpoint = 0.0f;
+static uint32_t      g_total_s = 0;
+static uint32_t      g_remaining_s = 0;
+static bool          g_setpoint_reached = false;
+static uint32_t      g_session_id = 0;   // Id de la última sesión iniciada (continúa tras reinicios)
+
+// g_motor_state = estado LÓGICO del motor (proceso pide motor encendido).
+// Con MOTOR_PULSE_ENABLE, el pin físico lo maneja vTaskMotorPulse generando pulsos.
+static bool g_motor_state = false;
+static bool g_heater_state = false;
+
+static bool sd_ok = false;
+static char shared_datetime[20] = "2026-09-29 19:07:00";
+static spi_device_handle_t max6675_dev;
+
+static SemaphoreHandle_t g_state_mutex = NULL;
+static SemaphoreHandle_t xSdMutex      = NULL;
+static SemaphoreHandle_t xTimeMutex    = NULL;
+static QueueHandle_t     xQueueSD      = NULL;
+static QueueHandle_t     xQueueSerial  = NULL;
+
+// Copia la fecha/hora actual del RTC (protegida por xTimeMutex)
+static void get_datetime(char *out, size_t len) {
+    xSemaphoreTake(xTimeMutex, portMAX_DELAY);
+    strlcpy(out, shared_datetime, len);
+    xSemaphoreGive(xTimeMutex);
+}
+
+// =======================================================================
+// CONTROLADOR SENSOR DHT11 (Únicamente Humedad Relativa)
+// =======================================================================
+
+static esp_err_t dht11_read_humidity(gpio_num_t gpio, float *humidity) {
+    uint8_t data[5] = {0};
+
+    gpio_set_direction(gpio, GPIO_MODE_OUTPUT);
+    gpio_set_level(gpio, 0);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    gpio_set_level(gpio, 1);
+    ets_delay_us(30);
+    gpio_set_direction(gpio, GPIO_MODE_INPUT);
+
+    uint16_t timeout = 0;
+    while (gpio_get_level(gpio) == 1) {
+        if (++timeout > 100) return ESP_ERR_TIMEOUT;
+        ets_delay_us(1);
+    }
+    timeout = 0;
+    while (gpio_get_level(gpio) == 0) {
+        if (++timeout > 100) return ESP_ERR_TIMEOUT;
+        ets_delay_us(1);
+    }
+    timeout = 0;
+    while (gpio_get_level(gpio) == 1) {
+        if (++timeout > 100) return ESP_ERR_TIMEOUT;
+        ets_delay_us(1);
+    }
+
+    for (int i = 0; i < 40; i++) {
+        timeout = 0;
+        while (gpio_get_level(gpio) == 0) {
+            if (++timeout > 100) return ESP_ERR_TIMEOUT;
+            ets_delay_us(1);
+        }
+
+        uint32_t t_high = 0;
+        while (gpio_get_level(gpio) == 1) {
+            t_high++;
+            ets_delay_us(1);
+            if (t_high > 100) return ESP_ERR_TIMEOUT;
+        }
+
+        if (t_high > 40) {
+            data[i / 8] |= (1 << (7 - (i % 8)));
+        }
+    }
+
+    if (data[4] == ((data[0] + data[1] + data[2] + data[3]) & 0xFF)) {
+        *humidity = (float)data[0] + (float)data[1] * 0.1f;
+        return ESP_OK;
+    }
+
+    return ESP_ERR_INVALID_CRC;
+}
+
+// =======================================================================
+// FUNCIONES DE HARDWARE (Relés, Indicadores, RTC DS3231, MAX6675)
+// =======================================================================
+
+void init_relay_gpios(void) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = RELAY_PIN_SEL,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+    gpio_set_level(MOTOR_RELAY_PIN, 0);
+    gpio_set_level(HEATER_RELAY_PIN, 0);
+}
+
+void init_indicator_gpios(void) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = INDICATOR_PIN_SEL,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+
+    // Estado inicial: sistema detenido
+    gpio_set_level(BUZZER_PIN, 0);
+    gpio_set_level(LED_ACTIVE_PIN, 0);
+    gpio_set_level(LED_STOPPED_PIN, 1);
+}
+
+// Cambia el estado de los dos relés. Debe llamarse con g_state_mutex tomado.
+// - Calefactor: se maneja directamente (nivel continuo).
+// - Motor: con MOTOR_PULSE_ENABLE solo se actualiza el estado lógico y la tarea
+//          vTaskMotorPulse genera los pulsos. Si se pide apagar, el pin se baja
+//          de inmediato para no esperar al siguiente paso de la tarea.
+static void set_outputs_locked(bool motor, bool heater) {
+    g_motor_state = motor;
+    g_heater_state = heater;
+#if MOTOR_PULSE_ENABLE
+    if (!motor) {
+        gpio_set_level(MOTOR_RELAY_PIN, 0);
+    }
+#else
+    gpio_set_level(MOTOR_RELAY_PIN, motor ? 1 : 0);
+#endif
+    gpio_set_level(HEATER_RELAY_PIN, heater ? 1 : 0);
+}
+
+static inline uint8_t bcd2dec(uint8_t v) { return ((v >> 4) * 10) + (v & 0x0F); }
+static inline uint8_t dec2bcd(uint8_t v) { return ((v / 10) << 4) | (v % 10); }
+
+static esp_err_t ds3231_set_time(const struct tm *t) {
+    uint8_t d[8];
+    d[0] = 0x00;
+    d[1] = dec2bcd(t->tm_sec);
+    d[2] = dec2bcd(t->tm_min);
+    d[3] = dec2bcd(t->tm_hour);
+    d[4] = dec2bcd(t->tm_wday + 1);
+    d[5] = dec2bcd(t->tm_mday);
+    d[6] = dec2bcd(t->tm_mon + 1);
+    d[7] = dec2bcd(t->tm_year % 100);
+    return i2c_master_write_to_device(I2C_NUM_0, DS3231_I2C_ADDR, d, sizeof(d), pdMS_TO_TICKS(1000));
+}
+
+static esp_err_t ds3231_get_time(struct tm *t) {
+    uint8_t reg = 0x00;
+    uint8_t d[7];
+    esp_err_t ret = i2c_master_write_read_device(I2C_NUM_0, DS3231_I2C_ADDR, &reg, 1, d, sizeof(d), pdMS_TO_TICKS(1000));
+    if (ret != ESP_OK) return ret;
+    t->tm_sec  = bcd2dec(d[0] & 0x7F);
+    t->tm_min  = bcd2dec(d[1] & 0x7F);
+    t->tm_hour = bcd2dec(d[2] & 0x3F);
+    t->tm_wday = bcd2dec(d[3] & 0x07) - 1;
+    t->tm_mday = bcd2dec(d[4] & 0x3F);
+    t->tm_mon  = bcd2dec(d[5] & 0x1F) - 1;
+    t->tm_year = bcd2dec(d[6]) + 100;
+    return ESP_OK;
+}
+
+static esp_err_t max6675_read(float *temp, uint8_t *status) {
+    uint16_t raw_data = 0;
+    uint8_t dummy_tx[2] = {0xFF, 0xFF};
+    bool valid = false;
+    uint16_t raw = 0;
+
+    for (int i = 0; i < 3 && !valid; i++) {
+        spi_transaction_t t = {
+            .length = 16,
+            .tx_buffer = dummy_tx,
+            .rx_buffer = &raw_data,
+        };
+        esp_err_t ret = spi_device_transmit(max6675_dev, &t);
+        if (ret != ESP_OK) {
+            *temp = 0.0f; *status = 2; return ret;
+        }
+        raw = __builtin_bswap16(raw_data);
+        valid = !(raw == 0x0000 || raw == 0xFFFF || (raw & 0x8000));
+        if (!valid) vTaskDelay(pdMS_TO_TICKS(220));
+    }
+
+    if (!valid) { *temp = 0.0f; *status = 2; return ESP_ERR_INVALID_RESPONSE; }
+
+    if (raw & 0x04) { *temp = 0.0f; *status = 1; }
+    else { *temp = (raw >> 3) * 0.25f; *status = 0; }
+    return ESP_OK;
+}
+
+// =======================================================================
+// LÓGICA DE HUMEDAD Y PARÁMETROS DEL MODO AUTOMÁTICO
+// =======================================================================
+
+static hum_class_t classify_humidity(float h) {
+    if (h < HUM_LIMIT_DRY) return HUM_DRY;
+    if (h > HUM_LIMIT_WET) return HUM_WET;
+    return HUM_IDEAL;
+}
+
+static const char *hum_class_text(hum_class_t c) {
+    switch (c) {
+        case HUM_DRY: return "MUY SECO (<10%)";
+        case HUM_WET: return "MUY HUMEDO (>12%)";
+        default:      return "IDEAL (10%-12%)";
+    }
+}
+
+static void auto_params_for(hum_class_t c, float *temp_c, uint32_t *secs) {
+    switch (c) {
+        case HUM_DRY:
+            *temp_c = AUTO_DRY_TEMP_C;
+            *secs = AUTO_DRY_TIME_S;
+            break;
+        case HUM_WET:
+            *temp_c = AUTO_WET_TEMP_C;
+            *secs = AUTO_WET_TIME_S;
+            break;
+        default:
+            *temp_c = AUTO_IDEAL_TEMP_C;
+            *secs = AUTO_IDEAL_TIME_S;
+            break;
+    }
+}
+
+// =======================================================================
+// REGISTRO EN SD: ARCHIVOS CSV
+// =======================================================================
+
+// Crea el archivo con su encabezado si no existe o está vacío
+static void sd_write_header_if_empty(const char *path, const char *header) {
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size == 0) {
+        FILE *f = fopen(path, "a");
+        if (f) {
+            fprintf(f, "%s\n", header);
+            fclose(f);
+        } else {
+            ESP_LOGE(TAG, "No se pudo crear %s", path);
+        }
+    }
+}
+
+// Prepara los dos archivos y devuelve el mayor sesion_id ya guardado (0 si no hay ninguno),
+// para que la numeración de sesiones continúe después de un reinicio.
+// Llamar después de montar la SD y antes de crear las tareas.
+static uint32_t sd_prepare_files(void) {
+    sd_write_header_if_empty(SESSIONS_FILE, SESSIONS_HEADER);
+    sd_write_header_if_empty(TEMPS_FILE, TEMPS_HEADER);
+
+    uint32_t max_id = 0;
+    FILE *f = fopen(SESSIONS_FILE, "r");
+    if (f) {
+        char line[160];
+        while (fgets(line, sizeof(line), f)) {
+            uint32_t v = (uint32_t)strtoul(line, NULL, 10);   // El encabezado da 0
+            if (v > max_id) max_id = v;
+        }
+        fclose(f);
+    }
+    return max_id;
+}
+
+// sesion_id,fecha,hora_inicio,humedad_inicio_pct,modo,temp_consigna_C,tiempo_s,tiempo_min
+static void format_session_csv(const sd_log_entry_t *e, char *out, size_t len) {
+    char hum[12];
+    if (e->humidity < 0.0f) {
+        strlcpy(hum, "NA", sizeof(hum));
+    } else {
+        snprintf(hum, sizeof(hum), "%.1f", e->humidity);
+    }
+    snprintf(out, len, "%lu,%.10s,%s,%s,%s,%.1f,%lu,%.2f",
+             (unsigned long)e->session_id,
+             e->datetime,            // fecha  (YYYY-MM-DD)
+             e->datetime + 11,       // hora   (HH:MM:SS)
+             hum,
+             (e->mode == ROAST_MODE_AUTO) ? "AUTOMATICO" : "MANUAL",
+             e->setpoint,
+             (unsigned long)e->total_s,
+             (float)e->total_s / 60.0f);
+}
+
+// sesion_id,fecha,hora,temperatura_C
+static void format_sample_csv(const sd_log_entry_t *e, char *out, size_t len) {
+    char temp[12];
+    if (e->max_status != 0) {
+        strlcpy(temp, "ERR", sizeof(temp));   // Falla de la termocupla
+    } else {
+        snprintf(temp, sizeof(temp), "%.2f", e->temp);
+    }
+    snprintf(out, len, "%lu,%.10s,%s,%s",
+             (unsigned long)e->session_id,
+             e->datetime,
+             e->datetime + 11,
+             temp);
+}
+
+// =======================================================================
+// SERVIDOR WEB Y HTML
+// =======================================================================
+
+static const char html_page[] =
+"<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+"<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+"<title>Control de Tostado ESP32</title>"
+"<style>"
+"body { font-family: Arial, sans-serif; background: #121212; color: #fff; text-align: center; margin: 0; padding: 20px; }"
+".card { background: #1e1e1e; padding: 20px; border-radius: 12px; margin: 15px auto; max-width: 420px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }"
+"h1 { color: #ff9800; font-size: 22px; }"
+".grid { display: flex; justify-content: space-around; gap: 10px; }"
+".box { flex: 1; background: #2a2a2a; padding: 12px; border-radius: 8px; }"
+".val { font-size: 28px; font-weight: bold; margin: 5px 0; }"
+".temp-color { color: #00e676; }"
+".hum-color { color: #00bcd4; }"
+".time-txt { font-size: 22px; color: #03a9f4; font-weight: bold; margin-top: 5px; }"
+".btn { background: #333; color: white; border: none; padding: 12px 20px; margin: 5px; font-size: 16px; border-radius: 6px; cursor: pointer; transition: 0.3s; }"
+".btn:hover { background: #555; }"
+".btn-active { background: #2196f3; font-weight: bold; }"
+".btn-on { background: #4caf50; }"
+".btn-off { background: #f44336; }"
+".btn:disabled { opacity: 0.4; cursor: not-allowed; }"
+".status-badge { display: inline-block; padding: 6px 12px; border-radius: 12px; font-size: 13px; margin-top: 5px; font-weight: bold; }"
+".badge-on { background: #2e7d32; color: #fff; }"
+".badge-off { background: #c62828; color: #fff; }"
+".badge-err { background: #d32f2f; color: #fff; }"
+".badge-warn { background: #ef6c00; color: #fff; }"
+".note { background: #2a2a2a; border-left: 4px solid #ff9800; padding: 10px; border-radius: 6px; font-size: 14px; text-align: left; margin-bottom: 12px; }"
+"label { display: block; margin-top: 10px; font-size: 14px; color: #bbb; }"
+"input[type=number] { width: 140px; padding: 10px; font-size: 18px; text-align: center; border-radius: 6px; border: 1px solid #555; background: #2a2a2a; color: #fff; margin-top: 4px; }"
+"input:disabled { opacity: 0.4; }"
+".info-line { margin-top: 8px; font-size: 14px; color: #ddd; }"
+"</style></head><body>"
+"<h1>Control de Tostado de Café</h1>"
+
+"<div class='card'>"
+"  <div>Hora del Sistema (RTC)</div>"
+"  <div class='time-txt' id='rtc-time'>--:--:--</div>"
+"</div>"
+
+"<div class='card'>"
+"  <h3>Mediciones Ambientales</h3>"
+"  <div class='grid'>"
+"    <div class='box'>"
+"      <small>Temp. Termocupla</small>"
+"      <div class='val temp-color' id='temp-max'>--.- °C</div>"
+"      <div id='st-max'></div>"
+"    </div>"
+"    <div class='box'>"
+"      <small>Humedad Aire (DHT11)</small>"
+"      <div class='val hum-color' id='hum-dht'>-- %</div>"
+"      <div id='st-dht'></div>"
+"    </div>"
+"  </div>"
+"</div>"
+
+"<div class='card'>"
+"  <h3>Proceso de Tostado</h3>"
+"  <div class='note'>El proceso de tostado está calibrado para <b>100 gramos</b> de la especie <b>Café Arábigo (Coffea arabica)</b>.</div>"
+"  <button id='tab-manual' class='btn btn-active' onclick='showTab(`manual`)'>Manual</button>"
+"  <button id='tab-auto' class='btn' onclick='showTab(`auto`)'>Automático</button>"
+
+"  <div id='panel-manual'>"
+"    <label>Temperatura de tostado (°C)</label>"
+"    <input type='number' id='in-temp' value='70' min='30' max='250' step='1'>"
+"    <label>Tiempo de tostado (minutos)</label>"
+"    <input type='number' id='in-time' value='5' min='1' max='120' step='0.5'><br><br>"
+"    <button id='btn-start-manual' class='btn btn-on' onclick='startManual()'>Iniciar</button>"
+"  </div>"
+
+"  <div id='panel-auto' style='display:none'>"
+"    <div class='info-line'>Humedad actual: <b id='auto-hum'>--</b></div>"
+"    <div class='info-line'>Parámetros según humedad:<br><b id='auto-params'>--</b></div><br>"
+"    <button id='btn-start-auto' class='btn btn-on' onclick='startAuto()'>Iniciar</button>"
+"  </div>"
+"</div>"
+
+"<div class='card'>"
+"  <h3>Estado del Proceso</h3>"
+"  <span id='proc-state' class='status-badge badge-off'>DETENIDO</span>"
+"  <div class='info-line' id='proc-info'>-</div>"
+"  <div class='time-txt' id='proc-remaining'>--:--</div>"
+"  <button id='btn-stop' class='btn btn-off' onclick='stopRoast()' disabled>Detener</button>"
+"</div>"
+
+"<script>"
+"let currentTab = 'manual';"
+"let prevState = 'IDLE';"
+"function showTab(t) {"
+"  currentTab = t;"
+"  document.getElementById('panel-manual').style.display = (t === 'manual') ? 'block' : 'none';"
+"  document.getElementById('panel-auto').style.display = (t === 'auto') ? 'block' : 'none';"
+"  document.getElementById('tab-manual').className = 'btn ' + (t === 'manual' ? 'btn-active' : '');"
+"  document.getElementById('tab-auto').className = 'btn ' + (t === 'auto' ? 'btn-active' : '');"
+"}"
+"function fmt(s) {"
+"  s = Math.max(0, Math.round(s));"
+"  let m = Math.floor(s / 60), r = s % 60;"
+"  return String(m).padStart(2, '0') + ':' + String(r).padStart(2, '0');"
+"}"
+"async function api(url) {"
+"  try {"
+"    let r = await fetch(url);"
+"    let j = await r.json();"
+"    if (!j.ok) alert(j.msg);"
+"  } catch(e) { alert('Error de comunicación con el equipo'); }"
+"  updateStatus();"
+"}"
+"function startManual() {"
+"  let t = parseFloat(document.getElementById('in-temp').value);"
+"  let m = parseFloat(document.getElementById('in-time').value);"
+"  if (isNaN(t) || isNaN(m)) { alert('Ingresa una temperatura y un tiempo válidos'); return; }"
+"  api('/api/start?mode=manual&temp=' + t + '&time=' + Math.round(m * 60));"
+"}"
+"function startAuto() { api('/api/start?mode=auto'); }"
+"function stopRoast() { api('/api/stop'); }"
+"async function updateStatus() {"
+"  try {"
+"    let res = await fetch('/api/status');"
+"    let data = await res.json();"
+"    document.getElementById('rtc-time').innerText = data.rtc_time;"
+"    if (data.max_err) {"
+"      document.getElementById('temp-max').innerText = 'ERR';"
+"      document.getElementById('st-max').innerHTML = `<span class='status-badge badge-err'>Error MAX</span>`;"
+"    } else {"
+"      document.getElementById('temp-max').innerText = data.temp_max.toFixed(1) + ' °C';"
+"      document.getElementById('st-max').innerText = '';"
+"    }"
+"    if (data.dht_err) {"
+"      document.getElementById('hum-dht').innerText = 'ERR';"
+"      document.getElementById('st-dht').innerHTML = `<span class='status-badge badge-err'>Error DHT</span>`;"
+"      document.getElementById('auto-hum').innerText = 'Sin lectura';"
+"    } else {"
+"      document.getElementById('hum-dht').innerText = data.humidity.toFixed(0) + ' %';"
+"      let badgeClass = 'badge-on';"
+"      if (data.hum_state.includes('SECO')) badgeClass = 'badge-warn';"
+"      else if (data.hum_state.includes('HUMEDO')) badgeClass = 'badge-err';"
+"      document.getElementById('st-dht').innerHTML = `<span class='status-badge ${badgeClass}'>${data.hum_state}</span>`;"
+"      document.getElementById('auto-hum').innerText = data.humidity.toFixed(0) + ' % - ' + data.hum_state;"
+"    }"
+"    if (data.auto_temp > 0) {"
+"      document.getElementById('auto-params').innerText = data.auto_temp.toFixed(0) + ' °C durante ' + data.auto_min.toFixed(0) + ' min';"
+"    } else {"
+"      document.getElementById('auto-params').innerText = 'Esperando lectura de humedad...';"
+"    }"
+"    let running = (data.state === 'RUNNING');"
+"    if (running && prevState !== 'RUNNING') showTab(data.mode === 'AUTO' ? 'auto' : 'manual');"
+"    prevState = data.state;"
+"    let badge = document.getElementById('proc-state');"
+"    let info = document.getElementById('proc-info');"
+"    if (running) {"
+"      badge.className = 'status-badge badge-on';"
+"      badge.innerText = 'EN PROCESO';"
+"      info.innerText = 'Modo ' + (data.mode === 'AUTO' ? 'Automático' : 'Manual') + ' | Objetivo: ' + data.setpoint.toFixed(0) + ' °C | Fase: ' + data.phase;"
+"      document.getElementById('proc-remaining').innerText = fmt(data.remaining_s) + ' restantes';"
+"    } else if (data.state === 'DONE') {"
+"      badge.className = 'status-badge badge-warn';"
+"      badge.innerText = 'FINALIZADO';"
+"      info.innerText = 'El tostado terminó. Motor y calefactor apagados.';"
+"      document.getElementById('proc-remaining').innerText = '00:00';"
+"    } else {"
+"      badge.className = 'status-badge badge-off';"
+"      badge.innerText = 'DETENIDO';"
+"      info.innerText = 'Sin proceso activo.';"
+"      document.getElementById('proc-remaining').innerText = '--:--';"
+"    }"
+"    document.getElementById('btn-start-manual').disabled = running;"
+"    document.getElementById('btn-start-auto').disabled = running;"
+"    document.getElementById('in-temp').disabled = running;"
+"    document.getElementById('in-time').disabled = running;"
+"    document.getElementById('btn-stop').disabled = !running;"
+"  } catch(e) { console.error(e); }"
+"}"
+"setInterval(updateStatus, 1500);"
+"updateStatus();"
+"</script></body></html>";
+
+static esp_err_t reply_json(httpd_req_t *req, const char *status, const char *json) {
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t reply_error(httpd_req_t *req, const char *status, const char *msg) {
+    char out[192];
+    snprintf(out, sizeof(out), "{\"ok\":false,\"msg\":\"%s\"}", msg);
+    return reply_json(req, status, out);
+}
+
+static esp_err_t root_get_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, html_page, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t status_get_handler(httpd_req_t *req) {
+    char json_response[512];
+    char rtc_buf[20];
+
+    get_datetime(rtc_buf, sizeof(rtc_buf));
+
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+
+    hum_class_t hc = classify_humidity(g_humidity_dht);
+    const char *hum_state_str = hum_class_text(hc);
+
+    // Vista previa de los parámetros del modo automático según la humedad actual
+    float auto_t = 0.0f;
+    uint32_t auto_s = 0;
+    if (g_dht_valid_once) {
+        auto_params_for(hc, &auto_t, &auto_s);
+    }
+
+    const char *state_str = "IDLE";
+    if (g_roast_state == ROAST_RUNNING) state_str = "RUNNING";
+    else if (g_roast_state == ROAST_DONE) state_str = "DONE";
+
+    const char *mode_str = "NONE";
+    if (g_roast_mode == ROAST_MODE_MANUAL) mode_str = "MANUAL";
+    else if (g_roast_mode == ROAST_MODE_AUTO) mode_str = "AUTO";
+
+    const char *phase_str = "-";
+    if (g_roast_state == ROAST_RUNNING) {
+        if (g_max_error) phase_str = "ERROR SENSOR";
+        else if (!g_setpoint_reached) phase_str = "CALENTANDO";
+        else phase_str = "MANTENIENDO";
+    }
+
+    snprintf(json_response, sizeof(json_response),
+             "{\"temp_max\":%.2f,\"max_err\":%s,\"humidity\":%.1f,\"dht_err\":%s,\"hum_state\":\"%s\","
+             "\"state\":\"%s\",\"mode\":\"%s\",\"phase\":\"%s\",\"setpoint\":%.1f,"
+             "\"total_s\":%lu,\"remaining_s\":%lu,\"auto_temp\":%.1f,\"auto_min\":%.1f,\"rtc_time\":\"%s\"}",
+             g_temp_max, g_max_error ? "true" : "false",
+             g_humidity_dht, g_dht_error ? "true" : "false",
+             hum_state_str,
+             state_str, mode_str, phase_str, g_setpoint,
+             (unsigned long)g_total_s, (unsigned long)g_remaining_s,
+             auto_t, (float)auto_s / 60.0f,
+             rtc_buf);
+    xSemaphoreGive(g_state_mutex);
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, json_response, HTTPD_RESP_USE_STRLEN);
+}
+
+// /api/start?mode=manual&temp=70&time=300   (time en segundos)
+// /api/start?mode=auto
+static esp_err_t start_handler(httpd_req_t *req) {
+    char buf[96] = {0};
+    char mode_str[12] = {0}, temp_str[16] = {0}, time_str[16] = {0};
+
+    if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) != ESP_OK ||
+        httpd_query_key_value(buf, "mode", mode_str, sizeof(mode_str)) != ESP_OK) {
+        return reply_error(req, "400 Bad Request", "Solicitud inválida");
+    }
+
+    roast_mode_t mode;
+    float temp_c = 0.0f;
+    uint32_t secs = 0;
+
+    if (strcmp(mode_str, "manual") == 0) {
+        mode = ROAST_MODE_MANUAL;
+        if (httpd_query_key_value(buf, "temp", temp_str, sizeof(temp_str)) != ESP_OK ||
+            httpd_query_key_value(buf, "time", time_str, sizeof(time_str)) != ESP_OK) {
+            return reply_error(req, "400 Bad Request", "Faltan la temperatura o el tiempo");
+        }
+        temp_c = strtof(temp_str, NULL);
+        long t = strtol(time_str, NULL, 10);
+        if (temp_c < ROAST_TEMP_MIN_C || temp_c > ROAST_TEMP_MAX_C) {
+            return reply_error(req, "400 Bad Request", "Temperatura fuera de rango (30 a 250 °C)");
+        }
+        if (t < ROAST_TIME_MIN_S || t > ROAST_TIME_MAX_S) {
+            return reply_error(req, "400 Bad Request", "Tiempo fuera de rango (10 s a 120 min)");
+        }
+        secs = (uint32_t)t;
+    } else if (strcmp(mode_str, "auto") == 0) {
+        mode = ROAST_MODE_AUTO;
+    } else {
+        return reply_error(req, "400 Bad Request", "Modo desconocido");
+    }
+
+    const char *err = NULL;
+
+    // Hora de inicio de la sesión (se lee antes de tomar g_state_mutex para no anidar mutex)
+    char start_dt[20];
+    get_datetime(start_dt, sizeof(start_dt));
+
+    sd_log_entry_t ev = {0};
+    bool session_started = false;
+
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    if (g_roast_state == ROAST_RUNNING) {
+        err = "Ya hay un proceso en marcha";
+    } else if (g_max_error) {
+        err = "Error en la termocupla MAX6675, no se puede iniciar";
+    } else if (mode == ROAST_MODE_AUTO && !g_dht_valid_once) {
+        err = "Aún no hay lectura válida de humedad";
+    } else {
+        if (mode == ROAST_MODE_AUTO) {
+            // Los parámetros se fijan con la humedad medida en el momento de iniciar
+            auto_params_for(classify_humidity(g_humidity_dht), &temp_c, &secs);
+        }
+        g_roast_mode = mode;
+        g_setpoint = temp_c;
+        g_total_s = secs;
+        g_remaining_s = secs;
+        g_setpoint_reached = false;
+        g_session_id++;
+        g_roast_state = ROAST_RUNNING;
+        // Arranque: motor encendido y calefactor encendido hasta llegar a la temperatura
+        set_outputs_locked(true, true);
+
+        // Datos de la sesión que se guardarán en sesiones.csv
+        ev.type = LOG_SESSION_START;
+        ev.session_id = g_session_id;
+        strlcpy(ev.datetime, start_dt, sizeof(ev.datetime));
+        ev.humidity = g_dht_valid_once ? g_humidity_dht : -1.0f;   // -1 -> "NA" en el CSV
+        ev.mode = mode;
+        ev.setpoint = temp_c;
+        ev.total_s = secs;
+        session_started = true;
+    }
+    xSemaphoreGive(g_state_mutex);
+
+    if (err) {
+        return reply_error(req, "409 Conflict", err);
+    }
+
+    // Se envía a la tarea de la SD fuera del mutex para no bloquear el control
+    if (sd_ok && session_started) {
+        if (xQueueSend(xQueueSD, &ev, pdMS_TO_TICKS(100)) != pdTRUE) {
+            ESP_LOGW(TAG, "Cola SD llena: no se registró el inicio de la sesión %lu",
+                     (unsigned long)ev.session_id);
+        }
+    }
+
+    ESP_LOGI(TAG, "Tostado iniciado (sesión %lu): %s, %.1f C, %lu s",
+             (unsigned long)ev.session_id,
+             (mode == ROAST_MODE_AUTO) ? "AUTO" : "MANUAL", temp_c, (unsigned long)secs);
+    return reply_json(req, "200 OK", "{\"ok\":true}");
+}
+
+static esp_err_t stop_handler(httpd_req_t *req) {
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    set_outputs_locked(false, false);
+    g_roast_state = ROAST_IDLE;
+    g_roast_mode = ROAST_MODE_NONE;
+    g_remaining_s = 0;
+    g_setpoint_reached = false;
+    xSemaphoreGive(g_state_mutex);
+
+    ESP_LOGI(TAG, "Tostado detenido por el usuario.");
+    return reply_json(req, "200 OK", "{\"ok\":true}");
+}
+
+httpd_handle_t start_webserver(void) {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.stack_size = 8192;
+    httpd_handle_t server = NULL;
+
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t uri_root = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler };
+        httpd_uri_t uri_status = { .uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler };
+        httpd_uri_t uri_start = { .uri = "/api/start", .method = HTTP_GET, .handler = start_handler };
+        httpd_uri_t uri_stop = { .uri = "/api/stop", .method = HTTP_GET, .handler = stop_handler };
+
+        httpd_register_uri_handler(server, &uri_root);
+        httpd_register_uri_handler(server, &uri_status);
+        httpd_register_uri_handler(server, &uri_start);
+        httpd_register_uri_handler(server, &uri_stop);
+    }
+    return server;
+}
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "Conectado a Wi-Fi. Ingresa a: http://" IPSTR, IP2STR(&event->ip_info.ip));
+    }
+}
+
+void wifi_init_sta(void) {
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+// =======================================================================
+// TAREAS RTOS (Control Maestro, SD, Serial, RTC, Motor e Indicadores)
+// =======================================================================
+
+static void vTaskRTC(void *pv) {
+    struct tm t;
+    char buf[20];
+    while (1) {
+        if (ds3231_get_time(&t) == ESP_OK) {
+            strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
+            xSemaphoreTake(xTimeMutex, portMAX_DELAY);
+            strlcpy(shared_datetime, buf, sizeof(shared_datetime));
+            xSemaphoreGive(xTimeMutex);
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+#if MOTOR_PULSE_ENABLE
+// Genera el tren de pulsos del motor (simula el pedal de la máquina de coser).
+// Mientras el proceso pide el motor encendido (g_motor_state = true), el relé de estado
+// sólido se activa MOTOR_PULSE_ON_MS al inicio de cada periodo de MOTOR_PULSE_PERIOD_MS
+// (1 pulso por segundo) y el resto del periodo permanece desactivado.
+// Al encenderse el motor el primer pulso arranca de inmediato; al apagarse, el pin baja ya.
+static void vTaskMotorPulse(void *pv) {
+    TickType_t last_wake = xTaskGetTickCount();
+    uint32_t phase_ms = 0;          // Posición dentro del periodo actual
+    bool prev_enabled = false;
+
+    while (1) {
+        // La lectura del estado y la escritura del pin se hacen dentro del mismo mutex
+        // para que un "Detener" no pueda ser pisado por un pulso que ya estaba decidido.
+        xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+        bool enabled = g_motor_state;
+
+        if (!enabled) {
+            gpio_set_level(MOTOR_RELAY_PIN, 0);
+            phase_ms = 0;
+        } else {
+            if (!prev_enabled) {
+                phase_ms = 0;       // Motor recién encendido: el pulso empieza ya
+            }
+            gpio_set_level(MOTOR_RELAY_PIN, (phase_ms < MOTOR_PULSE_ON_MS) ? 1 : 0);
+            phase_ms = (phase_ms + MOTOR_PULSE_STEP_MS) % MOTOR_PULSE_PERIOD_MS;
+        }
+        xSemaphoreGive(g_state_mutex);
+
+        prev_enabled = enabled;
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(MOTOR_PULSE_STEP_MS));
+    }
+}
+#endif
+
+static void vTaskSensorAndControl(void *pv) {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    TickType_t last_wake = xTaskGetTickCount();
+    uint8_t  loop_counter = 0;          // Para el puerto serie (cada 5 s, siempre)
+    uint8_t  sd_sample_tick = 0;        // Para la SD (cada SD_SAMPLE_PERIOD_S, solo con tostado activo)
+    uint32_t last_logged_session = 0;   // Detecta que empezó una sesión nueva
+
+    while (1) {
+        float temp_max = 0.0f;
+        uint8_t max_st = 0;
+
+        float hum_dht = 0.0f;
+        uint8_t dht_st = 0;
+
+        // 1. Lectura MAX6675
+        max6675_read(&temp_max, &max_st);
+
+        // 2. Lectura DHT11
+        esp_err_t dht_res = dht11_read_humidity(DHT11_PIN, &hum_dht);
+
+        xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+
+        g_max_error = (max_st != 0);
+        if (!g_max_error) {
+            g_temp_max = temp_max;
+        }
+
+        // Se guarda el valor de humedad solo si la lectura es válida para evitar ceros esporádicos
+        if (dht_res == ESP_OK) {
+            g_humidity_dht = hum_dht;
+            g_dht_valid_once = true;
+            g_dht_error = false;
+            dht_st = 0;
+        } else {
+            // Mantiene el último valor conocido; solo marca error si nunca hubo una lectura válida
+            g_dht_error = !g_dht_valid_once;
+            dht_st = 1;
+        }
+
+        // Se captura ANTES del control: si el tostado termina en este mismo ciclo,
+        // la última muestra (temperatura final) igualmente queda registrada en la SD.
+        bool     log_active  = (g_roast_state == ROAST_RUNNING);
+        uint32_t log_session = g_session_id;
+
+        // 3. Control del proceso de tostado (se ejecuta una vez por segundo)
+        if (g_roast_state == ROAST_RUNNING) {
+            bool heater = g_heater_state;
+
+            if (g_max_error) {
+                // Seguridad: sin lectura de temperatura el calefactor se apaga, el tambor sigue girando
+                heater = false;
+            } else {
+                if (g_temp_max >= g_setpoint) {
+                    g_setpoint_reached = true;
+                }
+                // Histéresis: apaga por encima de consigna+5, enciende por debajo de consigna-5
+                if (g_temp_max >= g_setpoint + ROAST_HYSTERESIS_C) {
+                    heater = false;
+                } else if (g_temp_max <= g_setpoint - ROAST_HYSTERESIS_C) {
+                    heater = true;
+                }
+            }
+            set_outputs_locked(true, heater);
+
+            bool count_time = (!ROAST_TIMER_FROM_SETPOINT) || g_setpoint_reached;
+            if (count_time && g_remaining_s > 0) {
+                g_remaining_s--;
+            }
+            if (g_remaining_s == 0) {
+                set_outputs_locked(false, false);
+                g_roast_state = ROAST_DONE;
+                ESP_LOGI(TAG, "Tostado finalizado.");
+            }
+        }
+
+        float current_hum = g_humidity_dht;
+        xSemaphoreGive(g_state_mutex);
+
+        // 4a. Puerto serie (cada 5 segundos, sin cambios)
+        loop_counter++;
+        if (loop_counter >= 5) {
+            loop_counter = 0;
+
+            datalog_entry_t s = {0};
+            s.timestamp_ms = esp_timer_get_time() / 1000;
+            get_datetime(s.datetime, sizeof(s.datetime));
+
+            s.temp_max6675 = temp_max;
+            s.max_status = max_st;
+            s.humidity_dht = current_hum;
+            s.dht_status = dht_st;
+
+            xQueueSend(xQueueSerial, &s, pdMS_TO_TICKS(50));
+        }
+
+        // 4b. SD: solo se guarda mientras el tostado está activo.
+        //     Primera muestra al iniciar la sesión y luego cada SD_SAMPLE_PERIOD_S segundos.
+        if (sd_ok && log_active) {
+            if (log_session != last_logged_session) {
+                last_logged_session = log_session;
+                sd_sample_tick = 0;               // Sesión nueva: muestra inmediata
+            }
+            if (sd_sample_tick == 0) {
+                sd_log_entry_t e = {0};
+                e.type = LOG_TEMP_SAMPLE;
+                e.session_id = log_session;
+                get_datetime(e.datetime, sizeof(e.datetime));
+                e.temp = temp_max;
+                e.max_status = max_st;
+                xQueueSend(xQueueSD, &e, pdMS_TO_TICKS(50));
+            }
+            sd_sample_tick = (sd_sample_tick + 1) % SD_SAMPLE_PERIOD_S;
+        }
+
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(1000));
+    }
+}
+
+// Indicadores: proceso activo -> buzzer intermitente (1 s sí / 1 s no) + LED rojo (GPIO 17)
+//              proceso detenido (IDLE o DONE) -> LED del GPIO 16
+static void vTaskIndicators(void *pv) {
+    const uint32_t half_ticks = BUZZER_HALF_PERIOD_MS / INDICATOR_TASK_PERIOD_MS;
+    uint32_t tick = 0;
+
+    while (1) {
+        xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+        bool running = (g_roast_state == ROAST_RUNNING);
+        xSemaphoreGive(g_state_mutex);
+
+        if (running) {
+            // Alterna cada 1 s: primero suena, luego silencio
+            bool buzzer_on = ((tick / half_ticks) % 2) == 0;
+            tick++;
+
+            gpio_set_level(BUZZER_PIN, buzzer_on ? 1 : 0);
+            gpio_set_level(LED_ACTIVE_PIN, 1);
+            gpio_set_level(LED_STOPPED_PIN, 0);
+        } else {
+            tick = 0;   // Al reiniciar, el ciclo vuelve a empezar sonando
+            gpio_set_level(BUZZER_PIN, 0);
+            gpio_set_level(LED_ACTIVE_PIN, 0);
+            gpio_set_level(LED_STOPPED_PIN, 1);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(INDICATOR_TASK_PERIOD_MS));
+    }
+}
+
+// Formato CSV del puerto serie (sin cambios)
+static void format_csv(const datalog_entry_t *d, char *out, size_t len) {
+    snprintf(out, len, "%llu,%s,%.2f,%u,%.1f,%u",
+             (unsigned long long)d->timestamp_ms, d->datetime,
+             d->temp_max6675, (unsigned)d->max_status,
+             d->humidity_dht, (unsigned)d->dht_status);
+}
+
+// Escribe en la SD: inicios de sesión -> sesiones.csv, muestras -> temperaturas.csv
+static void vTaskSDWriter(void *pv) {
+    sd_log_entry_t e;
+    char line[160];
+
+    while (1) {
+        if (xQueueReceive(xQueueSD, &e, portMAX_DELAY) == pdTRUE) {
+            const char *path;
+            if (e.type == LOG_SESSION_START) {
+                format_session_csv(&e, line, sizeof(line));
+                path = SESSIONS_FILE;
+            } else {
+                format_sample_csv(&e, line, sizeof(line));
+                path = TEMPS_FILE;
+            }
+
+            xSemaphoreTake(xSdMutex, portMAX_DELAY);
+            FILE *f = fopen(path, "a");
+            if (f) {
+                fprintf(f, "%s\n", line);
+                fclose(f);
+            } else {
+                ESP_LOGE(TAG, "No se pudo abrir %s", path);
+            }
+            xSemaphoreGive(xSdMutex);
+        }
+    }
+}
+
+static void vTaskSerial(void *pv) {
+    datalog_entry_t d;
+    char line[140];
+    printf("timestamp_ms,datetime,temp_max6675,estado_max,humedad_dht11,estado_dht\n");
+    while (1) {
+        if (xQueueReceive(xQueueSerial, &d, portMAX_DELAY) == pdTRUE) {
+            format_csv(&d, line, sizeof(line));
+            printf("%s\n", line);
+        }
+    }
+}
+
+// =======================================================================
+// MAIN
+// =======================================================================
+
+void app_main(void) {
+    esp_log_level_set(TAG, ESP_LOG_INFO);
+
+    // 1. Init Memoria NVS y Recursos FreeRTOS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    g_state_mutex = xSemaphoreCreateMutex();
+    xSdMutex      = xSemaphoreCreateMutex();
+    xTimeMutex    = xSemaphoreCreateMutex();
+    xQueueSD      = xQueueCreate(QUEUE_LEN, sizeof(sd_log_entry_t));
+    xQueueSerial  = xQueueCreate(QUEUE_LEN, sizeof(datalog_entry_t));
+
+    // 2. Init GPIO Relés (ambos apagados), Indicadores (buzzer/LEDs) y Pin DHT11
+    init_relay_gpios();
+    init_indicator_gpios();
+    gpio_reset_pin(DHT11_PIN);
+
+    // 3. I2C DS3231
+    i2c_config_t i2c_bus_cfg = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_SDA_PIN,
+        .scl_io_num = I2C_SCL_PIN,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 100000,
+    };
+    ESP_ERROR_CHECK(i2c_param_config(I2C_NUM_0, &i2c_bus_cfg));
+    ESP_ERROR_CHECK(i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0));
+
+#if SET_RTC_TIME_ON_BOOT
+    struct tm init_time = {
+        .tm_year = 2026 - 1900,
+        .tm_mon  = 9,
+        .tm_mday = 4,
+        .tm_hour = 11,
+        .tm_min  = 22,
+        .tm_sec  = 0,
+        .tm_wday = 2
+    };
+    ds3231_set_time(&init_time);
+#endif
+
+    // 4. Bus SPI 1: Tarjeta SD (SPI2_HOST)
+    spi_bus_config_t sd_bus_cfg = {
+        .mosi_io_num = PIN_SD_MOSI,
+        .miso_io_num = PIN_SD_MISO,
+        .sclk_io_num = PIN_SD_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4096,
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &sd_bus_cfg, SDSPI_DEFAULT_DMA));
+
+    // 5. Bus SPI 2: MAX6675 (SPI3_HOST)
+    spi_bus_config_t max_bus_cfg = {
+        .mosi_io_num = -1,
+        .miso_io_num = PIN_MAX_MISO,
+        .sclk_io_num = PIN_MAX_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 0,
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &max_bus_cfg, SPI_DMA_DISABLED));
+
+    spi_device_interface_config_t max_cfg = {
+        .clock_speed_hz = 100 * 1000,
+        .mode = 0,
+        .spics_io_num = PIN_CS_MAX6675,
+        .queue_size = 1,
+    };
+    ESP_ERROR_CHECK(spi_bus_add_device(SPI3_HOST, &max_cfg, &max6675_dev));
+
+    // 6. Montar Tarjeta SD en SPI2_HOST
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = false,
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024,
+    };
+    sdmmc_card_t *card;
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = SPI2_HOST;
+    host.max_freq_khz = 4000;
+
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = PIN_CS_SD;
+    slot_config.host_id = SPI2_HOST;
+
+    if (esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot_config, &mount_config, &card) == ESP_OK) {
+        sd_ok = true;
+        ESP_LOGI(TAG, "SD montada correctamente.");
+
+        // Crea sesiones.csv y temperaturas.csv (con encabezado) y retoma la numeración de sesiones
+        g_session_id = sd_prepare_files();
+        ESP_LOGI(TAG, "Última sesión registrada en SD: %lu", (unsigned long)g_session_id);
+    } else {
+        ESP_LOGE(TAG, "Fallo al montar SD.");
+    }
+
+    // 7. Servidor Web y Tareas RTOS
+    wifi_init_sta();
+    start_webserver();
+
+    xTaskCreate(vTaskRTC, "rtc_task", 3072, NULL, 3, NULL);
+    xTaskCreate(vTaskSensorAndControl, "sensor_control_task", 4096, NULL, 5, NULL);
+    xTaskCreate(vTaskSerial, "serial_task", 3072, NULL, 3, NULL);
+    xTaskCreate(vTaskIndicators, "indicator_task", 2048, NULL, 2, NULL);
+#if MOTOR_PULSE_ENABLE
+    // Prioridad 4: por debajo de la tarea de sensores (5) para no interferir con la
+    // lectura temporizada del DHT11; un retraso de pocos ms en el flanco del pulso es irrelevante.
+    xTaskCreate(vTaskMotorPulse, "motor_pulse_task", 2048, NULL, 4, NULL);
+#endif
+    if (sd_ok) {
+        xTaskCreate(vTaskSDWriter, "sd_task", 5120, NULL, 4, NULL);
+    }
+}
